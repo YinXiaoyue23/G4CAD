@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Geant4 REQUIRED)
+find_dependency(VTK REQUIRED)
+find_dependency(OpenCASCADE REQUIRED)
+
+include("${CMAKE_CURRENT_LIST_DIR}/G4CADTargets.cmake")
+
+if(TARGET G4CAD::G4CAD)
+  set_property(TARGET G4CAD::G4CAD APPEND PROPERTY
+    INTERFACE_INCLUDE_DIRECTORIES
+      "${Geant4_INCLUDE_DIRS};${OpenCASCADE_INCLUDE_DIR}")
+endif()

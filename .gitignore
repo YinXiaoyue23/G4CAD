@@ -1,0 +1,11 @@
+build/
+install/
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+*.obj
+*.user
+*.swp
+*.swo
