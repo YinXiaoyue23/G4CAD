@@ -8,6 +8,7 @@
 #include "G4VGraphicsScene.hh"
 #include "G4AutoLock.hh" // Mutex for thread-safe polyhedron creation
 #include "G4GeometryTolerance.hh"
+#include "G4Timer.hh"
 #include "Randomize.hh"
 
 // OCCT Headers
@@ -79,7 +80,12 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape)
     : G4VSolid(name), fShape(stepShape)
 {
     // Only compute the static bounding box here; do not initialize OCCT algorithms on construction.
+    G4Timer constructorTimer;
+    constructorTimer.Start();
     CalcBBox();
+    constructorTimer.Stop();
+    G4cout << "G4StepSolid timing: constructor for " << GetName()
+           << " took " << constructorTimer.GetRealElapsed() << " s" << G4endl;
 }
 
 G4StepSolid::~G4StepSolid() {
@@ -122,9 +128,14 @@ G4StepSolid& G4StepSolid::operator=(const G4StepSolid& rhs) {
 }
 
 void G4StepSolid::CalcBBox() {
+    G4Timer bboxTimer;
+    bboxTimer.Start();
     Bnd_Box box;
     BRepBndLib::Add(fShape, box);
     box.Get(fXmin, fYmin, fZmin, fXmax, fYmax, fZmax);
+    bboxTimer.Stop();
+    G4cout << "G4StepSolid timing: CalcBBox() took "
+           << bboxTimer.GetRealElapsed() << " s" << G4endl;
 }
 
 // ====================================================================

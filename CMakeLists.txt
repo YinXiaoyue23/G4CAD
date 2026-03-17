@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(G4CAD)
+project(G4CAD VERSION 0.1.0)
 
 # 1. Find dependencies
 # ============================================
@@ -27,13 +27,12 @@ target_link_libraries(G4CAD PUBLIC
 target_include_directories(G4CAD PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
-    ${Geant4_INCLUDE_DIRS}
-    ${OpenCASCADE_INCLUDE_DIR}
 )
 
 # 4. Install rules
 # ============================================
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 # Install library files (.so / .lib)
 install(TARGETS G4CAD
@@ -45,8 +44,26 @@ install(TARGETS G4CAD
 # Install public headers
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-# Export the CMake package configuration so users can call find_package(G4CAD).
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/G4CADConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/G4CADConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/G4CADConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/G4CAD
+)
+
 install(EXPORT G4CADTargets
-    FILE G4CADConfig.cmake
+    FILE G4CADTargets.cmake
+    NAMESPACE G4CAD::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/G4CAD
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/G4CADConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/G4CADConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/G4CAD
 )
