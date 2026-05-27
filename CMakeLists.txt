@@ -4,8 +4,7 @@ project(G4CAD VERSION 0.1.0)
 # 1. Find dependencies
 # ============================================
 find_package(Geant4 REQUIRED)
-find_package(VTK REQUIRED)
-find_package(OpenCASCADE REQUIRED) # Assume OpenCASCADE is available in the user environment (e.g. conda).
+find_package(OpenCASCADE REQUIRED)
 
 # 2. Define the library
 # ============================================
@@ -21,7 +20,9 @@ add_library(G4CAD SHARED ${SOURCES} ${HEADERS})
 
 target_link_libraries(G4CAD PUBLIC
     ${Geant4_LIBRARIES}
-    ${OpenCASCADE_LIBRARIES}
+    # Only the OCCT modules actually used — avoids pulling in vis modules that require VTK
+    TKernel TKMath TKG3d TKBRep TKGeomBase TKGeomAlgo TKTopAlgo TKMesh
+    TKSTEP TKSTEPBase TKSTEPAttr TKSTEP209 TKXSBase TKBO
 )
 
 target_include_directories(G4CAD PUBLIC
