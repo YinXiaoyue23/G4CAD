@@ -15,10 +15,16 @@
 #include <vector>
 #include <mutex>
 
+// Compile with -DG4CAD_DEBUG_TRACE to enable per-call geometry tracing.
+#ifdef G4CAD_DEBUG_TRACE
+#  define G4CAD_TRACE(...) G4cout << __VA_ARGS__ << G4endl
+#else
+#  define G4CAD_TRACE(...) do {} while(0)
+#endif
+
 class G4StepSolid : public G4VSolid {
 public:
-    // tolerance controls OCCT algorithm precision, default 1e-7
-    // (same units as shape coordinates, typically mm)
+    // tolerance controls OCCT algorithm precision (same units as shape coordinates, typically mm)
     G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
                 G4double tolerance = 1e-7);
     virtual ~G4StepSolid();
@@ -83,9 +89,17 @@ private:
     mutable G4bool        fRebuildPolyhedron = false;
 
     void CalcBBox();
-    void BuildFaceWeights();    // called once at construction to precompute face area weights
-    AlgoCache* GetAlgo() const; // lazily initialise the AlgoCache for the current thread
+    void BuildFaceWeights();
+    AlgoCache* GetAlgo() const;
     G4ThreeVector GetNormalAtIntersection(int index, const AlgoCache* algo) const;
+
+    // Unified ray-boundary helper used by both DistanceToIn(p,v) and DistanceToOut(p,v).
+    enum class BoundaryKind { Entry, Exit };
+    G4double RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVector& v,
+                               BoundaryKind kind,
+                               G4bool calcNorm = false,
+                               G4bool* validNorm = nullptr,
+                               G4ThreeVector* n = nullptr) const;
 };
 
 #endif

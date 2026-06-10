@@ -1,4 +1,5 @@
 #include "G4StepLoader.hh"
+#include "G4StepSolid.hh"
 #include "globals.hh"
 
 #include <STEPControl_Reader.hxx>

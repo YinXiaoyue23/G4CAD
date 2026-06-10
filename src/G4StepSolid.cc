@@ -30,26 +30,77 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
+
+// ====================================================================
+// Constants
+// ====================================================================
+namespace {
+    constexpr G4double kMeshDeflection  = 1.0;   // BRepMesh deflection (mm)
+    constexpr G4double kProbeMultiplier = 10.0;   // probe offset = tol * kProbeMultiplier
+    constexpr int      kMaxSurfRetry    = 20;     // GetPointOnSurface max retry attempts
+
+    G4Mutex polyhedronMutex = G4MUTEX_INITIALIZER;
+
+    // ====================================================================
+    // Helper: group ray-face intersections within tolerance.
+    // net = nOut - nIn per group:
+    //   net > 0  → real exit   (use for DistanceToOut)
+    //   net < 0  → real entry  (use for DistanceToIn)
+    //   net = 0  → internal coincident face; classify further via probe point
+    // ====================================================================
+    struct HitGroup {
+        G4double dist;
+        int      nIn  = 0;
+        int      nOut = 0;
+        int      firstOutIdx = -1;
+    };
+
+    std::vector<HitGroup> GroupHits(const IntCurvesFace_ShapeIntersector* isect,
+                                    G4double tol)
+    {
+        // Precondition: isect->Perform() has been called for the current ray.
+        int n = isect->NbPnt();
+        if (n == 0) return {};
+
+        std::vector<std::pair<G4double,int>> raw;
+        raw.reserve(n);
+        for (int i = 1; i <= n; ++i)
+            raw.push_back({isect->WParameter(i), i});
+        std::sort(raw.begin(), raw.end(),
+                  [](const auto& a, const auto& b){ return a.first < b.first; });
+
+        std::vector<HitGroup> groups;
+        for (auto& [d, idx] : raw) {
+            auto trans = isect->Transition(idx);
+            if (!groups.empty() && d - groups.back().dist < tol) {
+                if (trans == IntCurveSurface_In) groups.back().nIn++;
+                else {
+                    groups.back().nOut++;
+                    if (groups.back().firstOutIdx < 0) groups.back().firstOutIdx = idx;
+                }
+            } else {
+                HitGroup g;
+                g.dist = d;
+                if (trans == IntCurveSurface_In) { g.nIn = 1; }
+                else { g.nOut = 1; g.firstOutIdx = idx; }
+                groups.push_back(g);
+            }
+        }
+        return groups;
+    }
+
+    // Helper conversions
+    inline gp_Pnt       G4toOCCT(const G4ThreeVector& v) { return gp_Pnt(v.x(), v.y(), v.z()); }
+    inline G4ThreeVector OCCTtoG4(const gp_Dir& v)       { return G4ThreeVector(v.X(), v.Y(), v.Z()); }
+    inline G4ThreeVector OCCTtoG4(const gp_Pnt& v)       { return G4ThreeVector(v.X(), v.Y(), v.Z()); }
+} // namespace
 
 // ====================================================================
 // Static member definitions
 // ====================================================================
 std::vector<G4StepSolid::AlgoCache*> G4StepSolid::sAllCaches;
 std::mutex                            G4StepSolid::sAllCachesMutex;
-
-// ====================================================================
-// Mutex for polyhedron visualisation
-// ====================================================================
-namespace {
-    G4Mutex polyhedronMutex = G4MUTEX_INITIALIZER;
-}
-
-// ====================================================================
-// Helper conversion functions
-// ====================================================================
-static inline gp_Pnt G4toOCCT(const G4ThreeVector& v)  { return gp_Pnt(v.x(), v.y(), v.z()); }
-static inline G4ThreeVector OCCTtoG4(const gp_Dir& v)  { return G4ThreeVector(v.X(), v.Y(), v.Z()); }
-static inline G4ThreeVector OCCTtoG4(const gp_Pnt& v)  { return G4ThreeVector(v.X(), v.Y(), v.Z()); }
 
 // ====================================================================
 // AlgoCache
@@ -78,8 +129,6 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
 
 G4StepSolid::~G4StepSolid() {
     delete fpPolyhedron;
-
-    // Destroy all per-thread AlgoCaches registered in the global registry
     std::lock_guard<std::mutex> lock(sAllCachesMutex);
     for (AlgoCache* c : sAllCaches) delete c;
     sAllCaches.clear();
@@ -100,19 +149,18 @@ G4StepSolid::G4StepSolid(const G4StepSolid& rhs)
 G4StepSolid& G4StepSolid::operator=(const G4StepSolid& rhs) {
     if (this == &rhs) return *this;
     G4VSolid::operator=(rhs);
-    fShape         = rhs.fShape;
+    fShape          = rhs.fShape;
     fXmin = rhs.fXmin; fXmax = rhs.fXmax;
     fYmin = rhs.fYmin; fYmax = rhs.fYmax;
     fZmin = rhs.fZmin; fZmax = rhs.fZmax;
-    fTolerance     = rhs.fTolerance;
-    fFaces         = rhs.fFaces;
+    fTolerance      = rhs.fTolerance;
+    fFaces          = rhs.fFaces;
     fCumulativeArea = rhs.fCumulativeArea;
 
     delete fpPolyhedron;
     fpPolyhedron       = nullptr;
     fRebuildPolyhedron = true;
 
-    // Remove the current thread's cache from the registry and destroy it
     AlgoCache* algo = fAlgoCache.Get();
     if (algo) {
         std::lock_guard<std::mutex> lock(sAllCachesMutex);
@@ -125,7 +173,7 @@ G4StepSolid& G4StepSolid::operator=(const G4StepSolid& rhs) {
 }
 
 // ====================================================================
-// CalcBBox
+// Private helpers
 // ====================================================================
 void G4StepSolid::CalcBBox() {
     Bnd_Box box;
@@ -133,9 +181,6 @@ void G4StepSolid::CalcBBox() {
     box.Get(fXmin, fYmin, fZmin, fXmax, fYmax, fZmax);
 }
 
-// ====================================================================
-// BuildFaceWeights — run once at construction to precompute data needed by GetPointOnSurface
-// ====================================================================
 void G4StepSolid::BuildFaceWeights() {
     fFaces.clear();
     fCumulativeArea.clear();
@@ -163,9 +208,6 @@ void G4StepSolid::BuildFaceWeights() {
     }
 }
 
-// ====================================================================
-// GetAlgo — lazily initialise the current thread's AlgoCache
-// ====================================================================
 G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
     AlgoCache* algo = fAlgoCache.Get();
     if (!algo) {
@@ -177,162 +219,6 @@ G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
     return algo;
 }
 
-// ====================================================================
-// Inside
-// ====================================================================
-EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
-    if (p.x() < fXmin || p.x() > fXmax ||
-        p.y() < fYmin || p.y() > fYmax ||
-        p.z() < fZmin || p.z() > fZmax)
-        return kOutside;
-
-    AlgoCache* algo = GetAlgo();
-    algo->classifier->Perform(G4toOCCT(p), fTolerance);
-    TopAbs_State state = algo->classifier->State();
-
-    if (state == TopAbs_IN)  return kInside;
-    if (state == TopAbs_OUT) return kOutside;
-    return kSurface;
-}
-
-// ====================================================================
-// DistanceToIn(p, v)
-// ====================================================================
-G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
-    if (v.mag2() < fTolerance * fTolerance) return kInfinity;
-
-    AlgoCache* algo = GetAlgo();
-    gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
-    algo->intersector->Perform(ray, -fTolerance, kInfinity);
-
-    if (!algo->intersector->IsDone() || algo->intersector->NbPnt() == 0)
-        return kInfinity;
-
-    G4double minDist = kInfinity;
-    for (int i = 1; i <= algo->intersector->NbPnt(); ++i) {
-        G4double dist = algo->intersector->WParameter(i);
-        if (dist > fTolerance) {
-            if (dist < minDist) minDist = dist;
-        } else if (dist > -fTolerance &&
-                   algo->intersector->Transition(i) == IntCurveSurface_In) {
-            return 0.0;
-        }
-    }
-    return minDist;
-}
-
-// ====================================================================
-// DistanceToIn(p) — safety distance from an external point to the surface
-// ====================================================================
-G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
-    // Point is outside the bounding box: bbox distance is a conservative lower bound, use as fast path
-    G4double dx = std::max({fXmin - p.x(), p.x() - fXmax, 0.0});
-    G4double dy = std::max({fYmin - p.y(), p.y() - fYmax, 0.0});
-    G4double dz = std::max({fZmin - p.z(), p.z() - fZmax, 0.0});
-    G4double bboxDist = std::sqrt(dx*dx + dy*dy + dz*dz);
-    if (bboxDist > 0.0) return bboxDist;
-
-    // Point is inside the bounding box: compute exact distance to the shape surface
-    BRepExtrema_DistShapeShape extrema;
-    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
-    extrema.LoadS2(fShape);
-    extrema.Perform();
-    return extrema.IsDone() ? extrema.Value() : 0.0;
-}
-
-// ====================================================================
-// DistanceToOut(p, v)
-// ====================================================================
-G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
-                                    const G4bool calcNorm, G4bool* validNorm,
-                                    G4ThreeVector* n) const {
-    if (v.mag2() < fTolerance * fTolerance) {
-        if (validNorm) *validNorm = false;
-        return kInfinity;
-    }
-
-    AlgoCache* algo = GetAlgo();
-    gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
-    algo->intersector->Perform(ray, -fTolerance, kInfinity);
-
-    if (!algo->intersector->IsDone() || algo->intersector->NbPnt() == 0) {
-        if (validNorm) *validNorm = false;
-        return 0.0;  // point is outside; prevent infinite step
-    }
-
-    G4double minDist = kInfinity;
-    int      minIdx  = -1;
-    for (int i = 1; i <= algo->intersector->NbPnt(); ++i) {
-        G4double dist = algo->intersector->WParameter(i);
-        if (algo->intersector->Transition(i) != IntCurveSurface_Out) continue;
-
-        if (std::abs(dist) < fTolerance) {
-            if (calcNorm && validNorm) {
-                *n        = GetNormalAtIntersection(i, algo);
-                *validNorm = true;
-            }
-            return 0.0;
-        }
-        if (dist > fTolerance && dist < minDist) { minDist = dist; minIdx = i; }
-    }
-
-    if (minIdx != -1) {
-        if (calcNorm && validNorm) {
-            *n        = GetNormalAtIntersection(minIdx, algo);
-            *validNorm = true;
-        }
-        return minDist;
-    }
-    if (validNorm) *validNorm = false;
-    return 0.0;  // no outgoing intersection; point is outside
-}
-
-// ====================================================================
-// DistanceToOut(p) — safety distance from an interior point to the surface
-// ====================================================================
-G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
-    if (Inside(p) == kOutside) return 0.0;
-
-    BRepExtrema_DistShapeShape extrema;
-    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
-    extrema.LoadS2(fShape);
-    extrema.Perform();
-    return extrema.IsDone() ? extrema.Value() : 0.0;
-}
-
-// ====================================================================
-// SurfaceNormal
-// ====================================================================
-G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
-    BRepExtrema_DistShapeShape extrema;
-    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
-    extrema.LoadS2(fShape);
-    extrema.Perform();
-    if (!extrema.IsDone() || extrema.NbSolution() == 0)
-        return G4ThreeVector(0, 0, 1);
-
-    TopoDS_Shape support = extrema.SupportOnShape2(1);
-    if (support.ShapeType() == TopAbs_FACE) {
-        TopoDS_Face face = TopoDS::Face(support);
-        BRepAdaptor_Surface surf(face);
-        gp_Pnt pLoc = extrema.PointOnShape2(1);
-        GeomAPI_ProjectPointOnSurf proj(pLoc, surf.Surface().Surface());
-        Standard_Real u, v;
-        proj.LowerDistanceParameters(u, v);
-        gp_Pnt pSurf; gp_Vec d1u, d1v;
-        surf.D1(u, v, pSurf, d1u, d1v);
-        gp_Vec norm = d1u.Crossed(d1v);
-        if (face.Orientation() == TopAbs_REVERSED) norm.Reverse();
-        return OCCTtoG4(gp_Dir(norm));
-    }
-    gp_Pnt pLoc = extrema.PointOnShape2(1);
-    G4ThreeVector dir = p - OCCTtoG4(pLoc);
-    return (dir.mag2() > 0) ? dir.unit() : G4ThreeVector(0, 0, 1);
-}
-
-// ====================================================================
-// GetNormalAtIntersection
-// ====================================================================
 G4ThreeVector G4StepSolid::GetNormalAtIntersection(int index, const AlgoCache* algo) const {
     const TopoDS_Face& face = algo->intersector->Face(index);
     double u = algo->intersector->UParameter(index);
@@ -346,6 +232,211 @@ G4ThreeVector G4StepSolid::GetNormalAtIntersection(int index, const AlgoCache* a
 }
 
 // ====================================================================
+// RayCastToBoundary — unified core used by DistanceToIn/Out(p,v)
+//
+// For Entry: finds the first real entry group (net = nIn-nOut > 0)
+// For Exit:  finds the first real exit  group (net = nOut-nIn > 0)
+// net == 0 is resolved by probing a point just past the group:
+//   Exit probe outside → real exit;  inside → internal coincident face
+//   Entry probe inside → real entry; outside → external coincident face
+// ====================================================================
+G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVector& v,
+                                         BoundaryKind kind,
+                                         G4bool calcNorm, G4bool* validNorm,
+                                         G4ThreeVector* n) const
+{
+    if (validNorm) *validNorm = false;
+    if (v.mag2() < fTolerance * fTolerance) return kInfinity;
+
+    AlgoCache* algo = GetAlgo();
+    gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
+    algo->intersector->Perform(ray, -fTolerance, kInfinity);
+
+    if (!algo->intersector->IsDone() || algo->intersector->NbPnt() == 0)
+        return (kind == BoundaryKind::Entry) ? kInfinity : 0.0;
+
+    const bool wantExit = (kind == BoundaryKind::Exit);
+
+    auto isBoundaryGroup = [&](const HitGroup& g) -> bool {
+        int net = wantExit ? (g.nOut - g.nIn) : (g.nIn - g.nOut);
+        if (net > 0) return true;
+        if (net < 0) return false;
+        // net == 0: probe just past to distinguish internal from external coincident face
+        G4ThreeVector probe = p + (g.dist + fTolerance * kProbeMultiplier) * v;
+        algo->classifier->Perform(G4toOCCT(probe), fTolerance);
+        TopAbs_State state = algo->classifier->State();
+        bool probeOutside = (state == TopAbs_OUT);
+        G4CAD_TRACE("[G4StepSolid::" << GetName() << "] coincident-face probe dist=" << g.dist
+                    << " -> " << (probeOutside ? "exit" : "pass-through"));
+        return wantExit ? probeOutside : !probeOutside;
+    };
+
+    for (const auto& g : GroupHits(algo->intersector, fTolerance)) {
+        if (!isBoundaryGroup(g)) continue;
+
+        if (std::abs(g.dist) < fTolerance) {
+            if (calcNorm && validNorm && g.firstOutIdx >= 0) {
+                *n = GetNormalAtIntersection(g.firstOutIdx, algo);
+                *validNorm = true;
+            }
+            G4CAD_TRACE("[G4StepSolid::" << GetName() << "::"
+                        << (wantExit ? "DistanceToOut" : "DistanceToIn") << "][local]"
+                        << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                        << " v=(" << v.x() << "," << v.y() << "," << v.z() << ")"
+                        << " -> 0.0 (on boundary)");
+            return 0.0;
+        }
+        if (g.dist > fTolerance) {
+            if (calcNorm && validNorm && g.firstOutIdx >= 0) {
+                *n = GetNormalAtIntersection(g.firstOutIdx, algo);
+                *validNorm = true;
+            }
+            G4CAD_TRACE("[G4StepSolid::" << GetName() << "::"
+                        << (wantExit ? "DistanceToOut" : "DistanceToIn") << "][local]"
+                        << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                        << " v=(" << v.x() << "," << v.y() << "," << v.z() << ")"
+                        << " -> " << g.dist);
+            return g.dist;
+        }
+    }
+
+    if (kind == BoundaryKind::Entry) {
+        G4CAD_TRACE("[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
+                    << " no real entry -> kInfinity");
+        return kInfinity;
+    }
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::DistanceToOut][local]"
+                << " no real exit -> 0.0 (point outside)");
+    return 0.0;
+}
+
+// ====================================================================
+// Inside
+// ====================================================================
+EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
+    if (p.x() < fXmin || p.x() > fXmax ||
+        p.y() < fYmin || p.y() > fYmax ||
+        p.z() < fZmin || p.z() > fZmax)
+    {
+        G4CAD_TRACE("[G4StepSolid::" << GetName() << "::Inside][local]"
+                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                    << " -> kOutside (bbox)");
+        return kOutside;
+    }
+
+    AlgoCache* algo = GetAlgo();
+    algo->classifier->Perform(G4toOCCT(p), fTolerance);
+    TopAbs_State state = algo->classifier->State();
+
+    EInside result = (state == TopAbs_IN)  ? kInside
+                   : (state == TopAbs_OUT) ? kOutside
+                   :                         kSurface;
+
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::Inside][local]"
+                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                << " -> " << (result==kInside?"kInside":result==kOutside?"kOutside":"kSurface"));
+    return result;
+}
+
+// ====================================================================
+// DistanceToIn
+// ====================================================================
+G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
+    return RayCastToBoundary(p, v, BoundaryKind::Entry);
+}
+
+G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
+    G4double dx = std::max({fXmin - p.x(), p.x() - fXmax, 0.0});
+    G4double dy = std::max({fYmin - p.y(), p.y() - fYmax, 0.0});
+    G4double dz = std::max({fZmin - p.z(), p.z() - fZmax, 0.0});
+    G4double bboxDist = std::sqrt(dx*dx + dy*dy + dz*dz);
+    if (bboxDist > 0.0) {
+        G4CAD_TRACE("[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
+                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                    << " -> " << bboxDist << " (bbox)");
+        return bboxDist;
+    }
+
+    BRepExtrema_DistShapeShape extrema;
+    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
+    extrema.LoadS2(fShape);
+    extrema.Perform();
+    G4double result = extrema.IsDone() ? extrema.Value() : 0.0;
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
+                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                << " -> " << result);
+    return result;
+}
+
+// ====================================================================
+// DistanceToOut
+// ====================================================================
+G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
+                                    const G4bool calcNorm, G4bool* validNorm,
+                                    G4ThreeVector* n) const {
+    return RayCastToBoundary(p, v, BoundaryKind::Exit, calcNorm, validNorm, n);
+}
+
+G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
+    if (Inside(p) == kOutside) {
+        G4CAD_TRACE("[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
+                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                    << " -> 0.0 (outside)");
+        return 0.0;
+    }
+
+    BRepExtrema_DistShapeShape extrema;
+    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
+    extrema.LoadS2(fShape);
+    extrema.Perform();
+    G4double result = extrema.IsDone() ? extrema.Value() : 0.0;
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
+                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                << " -> " << result);
+    return result;
+}
+
+// ====================================================================
+// SurfaceNormal
+// ====================================================================
+G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
+    BRepExtrema_DistShapeShape extrema;
+    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
+    extrema.LoadS2(fShape);
+    extrema.Perform();
+    if (!extrema.IsDone() || extrema.NbSolution() == 0) {
+        G4CAD_TRACE("[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
+                    << " no solution -> (0,0,1)");
+        return G4ThreeVector(0, 0, 1);
+    }
+
+    G4ThreeVector result;
+    TopoDS_Shape support = extrema.SupportOnShape2(1);
+    if (support.ShapeType() == TopAbs_FACE) {
+        TopoDS_Face face = TopoDS::Face(support);
+        BRepAdaptor_Surface surf(face);
+        gp_Pnt pLoc = extrema.PointOnShape2(1);
+        GeomAPI_ProjectPointOnSurf proj(pLoc, surf.Surface().Surface());
+        Standard_Real u, v;
+        proj.LowerDistanceParameters(u, v);
+        gp_Pnt pSurf; gp_Vec d1u, d1v;
+        surf.D1(u, v, pSurf, d1u, d1v);
+        gp_Vec norm = d1u.Crossed(d1v);
+        if (face.Orientation() == TopAbs_REVERSED) norm.Reverse();
+        result = OCCTtoG4(gp_Dir(norm));
+    } else {
+        gp_Pnt pLoc = extrema.PointOnShape2(1);
+        G4ThreeVector dir = p - OCCTtoG4(pLoc);
+        result = (dir.mag2() > 0) ? dir.unit() : G4ThreeVector(0, 0, 1);
+    }
+
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
+                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                << " -> (" << result.x() << "," << result.y() << "," << result.z() << ")");
+    return result;
+}
+
+// ====================================================================
 // GetPointOnSurface
 // ====================================================================
 G4ThreeVector G4StepSolid::GetPointOnSurface() const {
@@ -353,9 +444,7 @@ G4ThreeVector G4StepSolid::GetPointOnSurface() const {
 
     const G4double totalArea = fCumulativeArea.back();
 
-    // Retry up to 20 times; trimmed face UV domains may extend beyond the actual face boundary
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        // Select a face by area weight
+    for (int attempt = 0; attempt < kMaxSurfRetry; ++attempt) {
         G4double r   = G4UniformRand() * totalArea;
         auto     it  = std::lower_bound(fCumulativeArea.begin(), fCumulativeArea.end(), r);
         int      idx = static_cast<int>(it - fCumulativeArea.begin());
@@ -372,7 +461,7 @@ G4ThreeVector G4StepSolid::GetPointOnSurface() const {
         if (Inside(candidate) != kOutside) return candidate;
     }
 
-    // Fallback: use the UV midpoint of the first face, guaranteed to be on the surface
+    // Fallback: UV midpoint of first face
     const FaceEntry& fe = fFaces[0];
     BRepAdaptor_Surface surf(fe.face);
     gp_Pnt pt = surf.Value(0.5*(fe.u0+fe.u1), 0.5*(fe.v0+fe.v1));
@@ -380,22 +469,26 @@ G4ThreeVector G4StepSolid::GetPointOnSurface() const {
 }
 
 // ====================================================================
-// BoundingLimits
+// BoundingLimits / CalculateExtent
 // ====================================================================
 void G4StepSolid::BoundingLimits(G4ThreeVector& pMin, G4ThreeVector& pMax) const {
     pMin.set(fXmin, fYmin, fZmin);
     pMax.set(fXmax, fYmax, fZmax);
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::BoundingLimits]"
+                << " pMin=(" << fXmin << "," << fYmin << "," << fZmin << ")"
+                << " pMax=(" << fXmax << "," << fYmax << "," << fZmax << ")");
 }
 
-// ====================================================================
-// CalculateExtent
-// ====================================================================
 G4bool G4StepSolid::CalculateExtent(const EAxis pAxis, const G4VoxelLimits& pVoxelLimit,
                                     const G4AffineTransform& pTransform,
                                     G4double& pMin, G4double& pMax) const {
     G4ThreeVector bmin(fXmin, fYmin, fZmin), bmax(fXmax, fYmax, fZmax);
     G4BoundingEnvelope bbox(bmin, bmax);
-    return bbox.CalculateExtent(pAxis, pVoxelLimit, pTransform, pMin, pMax);
+    G4bool result = bbox.CalculateExtent(pAxis, pVoxelLimit, pTransform, pMin, pMax);
+    G4CAD_TRACE("[G4StepSolid::" << GetName() << "::CalculateExtent]"
+                << " axis=" << pAxis
+                << " -> [" << pMin << "," << pMax << "]  ok=" << result);
+    return result;
 }
 
 // ====================================================================
@@ -419,15 +512,15 @@ G4Polyhedron* G4StepSolid::GetPolyhedron() const {
 }
 
 G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
-    G4cout << ">>> Generating mesh for " << GetName() << " ..." << G4endl;
+    G4cout << ">>> G4StepSolid: generating mesh for " << GetName() << " ..." << G4endl;
 
     try {
-        BRepMesh_IncrementalMesh meshGen(fShape, 1.0);
+        BRepMesh_IncrementalMesh meshGen(fShape, kMeshDeflection);
     } catch (const std::exception& e) {
-        G4cerr << "G4StepSolid::CreatePolyhedron: mesh generation failed for "
+        G4cerr << "G4StepSolid::CreatePolyhedron: mesh failed for "
                << GetName() << ": " << e.what() << G4endl;
     } catch (...) {
-        G4cerr << "G4StepSolid::CreatePolyhedron: mesh generation failed for "
+        G4cerr << "G4StepSolid::CreatePolyhedron: mesh failed for "
                << GetName() << " (unknown exception)" << G4endl;
     }
 
