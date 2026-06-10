@@ -15,13 +15,6 @@
 #include <vector>
 #include <mutex>
 
-// Compile with -DG4CAD_DEBUG_TRACE to enable per-call geometry tracing.
-#ifdef G4CAD_DEBUG_TRACE
-#  define G4CAD_TRACE(...) G4cout << __VA_ARGS__ << G4endl
-#else
-#  define G4CAD_TRACE(...) do {} while(0)
-#endif
-
 class G4StepSolid : public G4VSolid {
 public:
     // tolerance controls OCCT algorithm precision (same units as shape coordinates, typically mm)
@@ -31,6 +24,13 @@ public:
 
     G4StepSolid(const G4StepSolid& rhs);
     G4StepSolid& operator=(const G4StepSolid& rhs);
+
+    // --- Verbosity (Geant4 convention) ---
+    // 0 = silent (default)
+    // 1 = construction messages (mesh generation, load progress)
+    // 2 = per-call geometry tracing (Inside, DistanceToIn/Out, ...)
+    void   SetVerboseLevel(G4int level) { fVerboseLevel = level; }
+    G4int  GetVerboseLevel() const      { return fVerboseLevel; }
 
     // --- Geant4 core geometry interface ---
     virtual EInside Inside(const G4ThreeVector& p) const override;
@@ -56,6 +56,8 @@ public:
     virtual G4ThreeVector GetPointOnSurface() const override;
 
 private:
+    G4int fVerboseLevel = 0;
+
     // Read-only geometry data, shared across all threads
     TopoDS_Shape fShape;
     G4double fXmin, fXmax, fYmin, fYmax, fZmin, fZmax;
