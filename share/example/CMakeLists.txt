@@ -6,7 +6,7 @@ find_package(Geant4 REQUIRED)
 include(${Geant4_USE_FILE})
 
 # ── OpenCASCADE workaround ───────────────────────────────────────────────────
-# conda's opencascade builds TKIVtk against VTK; stub the target so cmake
+# conda's occt package builds TKIVtk against VTK; stub the target so cmake
 # does not error when VTK is absent (G4CAD does not use OCCT vis modules).
 if(NOT TARGET VTK::CommonCore)
     add_library(VTK::CommonCore INTERFACE IMPORTED)

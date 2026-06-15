@@ -19,14 +19,15 @@
 
 ## Installation via conda
 
-The recommended way to get all dependencies on Linux is through conda-forge:
+The recommended way to get all dependencies on Linux is through conda-forge.  
+Package names are taken from a known-working environment (Geant4 11.0.3, OCCT 7.7.1):
 
 ```bash
-conda create -n g4cad -c conda-forge geant4 opencascade cmake cxx-compiler
+conda create -n g4cad -c conda-forge geant4 occt cmake cxx-compiler
 conda activate g4cad
 ```
 
-> **Note:** conda's opencascade package links the visualisation module `TKIVtk` against VTK. G4CAD does not use any OCCT visualisation modules, so VTK is **not** required. The CMakeLists files include a stub that silences the resulting cmake error automatically.
+> **Note:** conda's `occt` package links the visualisation module `TKIVtk` against VTK. G4CAD does not use any OCCT visualisation modules, so VTK is **not** required. The CMakeLists files include a stub that silences the resulting cmake error automatically.
 
 ## Build and install
 
