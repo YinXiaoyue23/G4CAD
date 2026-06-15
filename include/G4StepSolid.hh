@@ -11,9 +11,12 @@
 #include <TopoDS_Face.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <IntCurvesFace_ShapeIntersector.hxx>
+#include <TopTools_DataMapOfShapeInteger.hxx>
 
 #include <vector>
 #include <mutex>
+#include <memory>
+#include <fstream>
 
 class G4StepSolid : public G4VSolid {
 public:
@@ -31,6 +34,8 @@ public:
     // 2 = per-call geometry tracing (Inside, DistanceToIn/Out, ...)
     void   SetVerboseLevel(G4int level) { fVerboseLevel = level; }
     G4int  GetVerboseLevel() const      { return fVerboseLevel; }
+    void   SetTimingEnabled(G4bool);
+    static void PrintAllTimingReports();
 
     // --- Geant4 core geometry interface ---
     virtual EInside Inside(const G4ThreeVector& p) const override;
@@ -61,7 +66,10 @@ private:
     // Read-only geometry data, shared across all threads
     TopoDS_Shape fShape;
     G4double fXmin, fXmax, fYmin, fYmax, fZmin, fZmax;
-    G4double fTolerance;
+    G4double fTolerance;          // requested tolerance (from ctor / yaml)
+    // NOTE: per-solid tolerance state lives in AlgoCache (below), NOT here — adding
+    // non-static members to G4StepSolid would change sizeof and break ABI with
+    // libGeometry, which does `new G4StepSolid(...)` against this header.
 
     // For GetPointOnSurface: precomputed at construction, read-only at runtime, lock-free
     struct FaceEntry {
@@ -73,11 +81,34 @@ private:
 
     // Thread-local OCCT algorithm objects
     struct AlgoCache {
-        BRepClass3d_SolidClassifier*    classifier  = nullptr;
+        // Per-solid classifiers: point is inside the assembly if inside ANY solid.
+        // Using individual solids avoids BRepClass3d_SolidClassifier's known misclassification
+        // of points near assembly joints when applied to a compound shape.
+        std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> solidClassifiers;
         IntCurvesFace_ShapeIntersector* intersector = nullptr;
+
+        // --- Per-solid tolerance (Part B), kept here so G4StepSolid's ABI is unchanged ---
+        // Each solid carries geometric noise σ_i (max BRep tol over its faces/edges/vertices).
+        // A clean solid gets a tight surface band; a noisy one (RP.step #5/#6) gets 2σ_i so
+        // Inside()/DistanceToOut() stay self-consistent.
+        //   solidTol[i] = max(requested, 2·σ_i)   (per-solid surface band)
+        //   occtTol     = max over solidTol       (global OCCT search/grouping window)
+        // faceSolidMap maps each face (by identity) to its owning solid index, so a ray hit
+        // looks up its band. perSolidTol=false (env G4CAD_PERSOLID_TOL=0) → global single tol.
+        std::vector<G4double>          solidTol;
+        TopTools_DataMapOfShapeInteger faceSolidMap;
+        G4double                       requestedTol = 1e-7;
+        G4double                       occtTol      = 1e-7;
+        bool                           perSolidTol  = true;
 
         AlgoCache(const TopoDS_Shape& shape, G4double tolerance);
         ~AlgoCache();
+
+        int      FaceToSolid(const TopoDS_Face& f) const;  // -1 if not found
+        G4double SolidBand(int si) const {                 // surface band for a solid (or global)
+            if (perSolidTol && si >= 0 && si < (int)solidTol.size()) return solidTol[si];
+            return requestedTol;
+        }
     };
 
     mutable G4Cache<AlgoCache*> fAlgoCache;
@@ -85,6 +116,22 @@ private:
     // Global registry for destroying all per-thread AlgoCaches on object destruction
     static std::vector<AlgoCache*> sAllCaches;
     static std::mutex               sAllCachesMutex;
+
+    // --- Query recorder (env-var gated, zero cost when off) ---
+    // Enable with  G4CAD_RECORD=/path/queries.csv  (optionally G4CAD_RECORD_EVENT=N).
+    // Records every Inside / DistanceToIn(p,v) / DistanceToOut(p,v) for FreeCAD
+    // visualisation of navigation queries. Event tag = G4Run::GetRunID().
+    enum class QueryType { Inside, DistToIn, DistToOut };
+    static bool           sRecordEnabled;
+    static int            sRecordOnlyEvent;
+    static std::ofstream  sRecordStream;
+    static std::mutex     sRecordMutex;
+    static std::once_flag sRecordInitFlag;
+    static long           sRecordSeq;
+    static void InitRecorderOnce();
+    void RecordQuery(QueryType type, const G4ThreeVector& p,
+                     const G4ThreeVector& v, int insideResult,
+                     G4double dist, int insideAtP) const;
 
     // Visualisation cache (mutex-protected)
     mutable G4Polyhedron* fpPolyhedron      = nullptr;

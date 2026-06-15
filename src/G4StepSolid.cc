@@ -8,6 +8,11 @@
 #include "G4VGraphicsScene.hh"
 #include "G4AutoLock.hh"
 #include "Randomize.hh"
+#include "G4RunManager.hh"
+#include "G4Run.hh"
+#include "G4EventManager.hh"
+#include "G4TrackingManager.hh"
+#include "G4Track.hh"
 
 // OCCT Headers
 #include <TopoDS.hxx>
@@ -15,6 +20,7 @@
 #include <BRepTools.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <Poly_Triangulation.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
@@ -30,6 +36,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -44,6 +51,7 @@ namespace {
         int      nIn  = 0;
         int      nOut = 0;
         int      firstOutIdx = -1;
+        int      anyIdx      = -1;  // any hit index in this group (for face→solid lookup)
     };
 
     std::vector<HitGroup> GroupHits(const IntCurvesFace_ShapeIntersector* isect,
@@ -62,6 +70,9 @@ namespace {
         std::vector<HitGroup> groups;
         for (auto& [d, idx] : raw) {
             auto trans = isect->Transition(idx);
+            // Tangent intersections do not cross the boundary; skip them.
+            // Counting a tangent as In or Out would corrupt the net crossing count.
+            if (trans == IntCurveSurface_Tangent) continue;
             if (!groups.empty() && d - groups.back().dist < tol) {
                 if (trans == IntCurveSurface_In) groups.back().nIn++;
                 else {
@@ -71,6 +82,7 @@ namespace {
             } else {
                 HitGroup g;
                 g.dist = d;
+                g.anyIdx = idx;
                 if (trans == IntCurveSurface_In) { g.nIn = 1; }
                 else { g.nOut = 1; g.firstOutIdx = idx; }
                 groups.push_back(g);
@@ -90,17 +102,147 @@ namespace {
 std::vector<G4StepSolid::AlgoCache*> G4StepSolid::sAllCaches;
 std::mutex                            G4StepSolid::sAllCachesMutex;
 
+// Query recorder (debug-only)
+bool           G4StepSolid::sRecordEnabled   = false;
+int            G4StepSolid::sRecordOnlyEvent = -1;
+std::ofstream  G4StepSolid::sRecordStream;
+std::mutex     G4StepSolid::sRecordMutex;
+std::once_flag G4StepSolid::sRecordInitFlag;
+long           G4StepSolid::sRecordSeq       = 0;
+
+namespace {
+    // Max BRep tolerance over a sub-shape's faces/edges/vertices = its geometric noise σ.
+    G4double ShapeNoise(const TopoDS_Shape& s) {
+        G4double m = 0.0;
+        for (TopExp_Explorer e(s, TopAbs_FACE);   e.More(); e.Next())
+            m = std::max(m, BRep_Tool::Tolerance(TopoDS::Face(e.Current())));
+        for (TopExp_Explorer e(s, TopAbs_EDGE);   e.More(); e.Next())
+            m = std::max(m, BRep_Tool::Tolerance(TopoDS::Edge(e.Current())));
+        for (TopExp_Explorer e(s, TopAbs_VERTEX); e.More(); e.Next())
+            m = std::max(m, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
+        return m;
+    }
+} // namespace
+
+int G4StepSolid::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
+    if (faceSolidMap.IsBound(f)) return faceSolidMap.Find(f);
+    return -1;
+}
+
+// ====================================================================
+// Query recorder (debug-only)
+// ====================================================================
+namespace {
+    const char* EInsideName(int e) {
+        return (e == kInside) ? "kInside"
+             : (e == kOutside) ? "kOutside"
+             : (e == kSurface) ? "kSurface" : "";
+    }
+}
+
+void G4StepSolid::InitRecorderOnce() {
+    const char* path = std::getenv("G4CAD_RECORD");
+    if (!path || !*path) { sRecordEnabled = false; return; }
+    sRecordStream.open(path, std::ios::out | std::ios::trunc);
+    if (!sRecordStream.is_open()) {
+        G4cerr << "[G4StepSolid] G4CAD_RECORD set but cannot open " << path << G4endl;
+        sRecordEnabled = false;
+        return;
+    }
+    const char* evEnv = std::getenv("G4CAD_RECORD_EVENT");
+    sRecordOnlyEvent = (evEnv && *evEnv) ? std::atoi(evEnv) : -1;
+    sRecordStream << "seq,event,trackid,parentid,type,px,py,pz,vx,vy,vz,"
+                  << "result,dist,inside_at_p,solid\n";
+    sRecordEnabled = true;
+    G4cout << "[G4StepSolid] query recorder ON -> " << path
+           << "  (event tag = G4Run::GetRunID())";
+    if (sRecordOnlyEvent >= 0) G4cout << " [event " << sRecordOnlyEvent << " only]";
+    G4cout << G4endl;
+}
+
+void G4StepSolid::RecordQuery(QueryType type, const G4ThreeVector& p,
+                              const G4ThreeVector& v, int insideResult,
+                              G4double dist, int insideAtP) const {
+    if (!sRecordEnabled) return;
+
+    int evid = -1;
+    if (const G4Run* run = G4RunManager::GetRunManager()->GetCurrentRun())
+        evid = run->GetRunID();
+    if (sRecordOnlyEvent >= 0 && evid != sRecordOnlyEvent) return;
+
+    // Track identity, so FreeCAD can group queries into per-track polylines.
+    int tid = -1, pid = -1;
+    if (G4TrackingManager* tm = G4EventManager::GetEventManager()->GetTrackingManager())
+        if (const G4Track* trk = tm->GetTrack()) {
+            tid = trk->GetTrackID();
+            pid = trk->GetParentID();
+        }
+
+    const char* tname = (type == QueryType::Inside)   ? "INSIDE"
+                      : (type == QueryType::DistToIn)  ? "DTI" : "DTO";
+    const char* res   = (type == QueryType::Inside) ? EInsideName(insideResult) : "";
+    const char* inAtP = (type == QueryType::DistToOut) ? EInsideName(insideAtP) : "";
+
+    std::lock_guard<std::mutex> lock(sRecordMutex);
+    sRecordStream << sRecordSeq++ << ',' << evid << ',' << tid << ',' << pid << ','
+                  << tname << ','
+                  << p.x() << ',' << p.y() << ',' << p.z() << ','
+                  << v.x() << ',' << v.y() << ',' << v.z() << ','
+                  << res << ',';
+    if (type == QueryType::Inside) sRecordStream << ',';      // dist empty for INSIDE
+    else                           sRecordStream << dist << ',';
+    sRecordStream << inAtP << ',' << GetName() << '\n';
+    if ((sRecordSeq & 0x7F) == 0) sRecordStream.flush();      // survive stuck-kill
+}
+
 // ====================================================================
 // AlgoCache
 // ====================================================================
 G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance) {
-    classifier  = new BRepClass3d_SolidClassifier(shape);
+    requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
+
+    // Per-solid toggle. Default OFF (global single tolerance) — empirically the dev
+    // hybrid (BRepClass3d Inside + ray DistanceToOut) is already stable at the small
+    // global tolerance, and widening a noisy solid's band only desyncs DistanceToOut
+    // from BRepClass3d (creates zero-step contradictions). Opt in with G4CAD_PERSOLID_TOL=1.
+    const char* psEnv = std::getenv("G4CAD_PERSOLID_TOL");
+    perSolidTol = (psEnv && psEnv[0] == '1');
+
+    // Build per-solid classifiers, per-solid bands, and face→solid map in one pass.
+    G4double globalMax = requestedTol;
+    int si = 0;
+    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next(), ++si) {
+        const TopoDS_Shape& s = ex.Current();
+        solidClassifiers.push_back(std::make_unique<BRepClass3d_SolidClassifier>(s));
+        G4double sigma = ShapeNoise(s);
+        G4double band  = std::max(requestedTol, 2.0 * sigma);  // self-consistency: band >= 2σ
+        solidTol.push_back(band);
+        globalMax = std::max(globalMax, band);
+        for (TopExp_Explorer fe(s, TopAbs_FACE); fe.More(); fe.Next())
+            if (!faceSolidMap.IsBound(fe.Current()))
+                faceSolidMap.Bind(fe.Current(), si);
+    }
+    // Global mode: OCCT search/grouping uses plain requested tol (pure "current dev").
+    occtTol = perSolidTol ? globalMax : requestedTol;
+    if (solidTol.empty()) { solidTol.push_back(requestedTol); occtTol = requestedTol; }
+
+    // One-time tolerance table (env G4CAD_TOL_VERBOSE), to confirm which solids got widened.
+    static std::once_flag tolPrintFlag;
+    if (std::getenv("G4CAD_TOL_VERBOSE"))
+        std::call_once(tolPrintFlag, [&]{
+            G4cout << "[G4StepSolid] per-solid tolerance "
+                   << (perSolidTol ? "ON" : "OFF(global)")
+                   << "  requested=" << requestedTol << " occtTol=" << occtTol << " mm\n";
+            for (size_t i = 0; i < solidTol.size(); ++i)
+                G4cout << "    solid#" << i << "  band=" << solidTol[i] << " mm\n";
+            G4cout << G4endl;
+        });
+
     intersector = new IntCurvesFace_ShapeIntersector();
-    intersector->Load(shape, tolerance);
+    intersector->Load(shape, occtTol);
 }
 
 G4StepSolid::AlgoCache::~AlgoCache() {
-    delete classifier;
     delete intersector;
 }
 
@@ -111,6 +253,10 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
                           G4double tolerance)
     : G4VSolid(name), fShape(stepShape), fTolerance(tolerance)
 {
+    // Resolve the debug query recorder once (reads G4CAD_RECORD env); zero cost when off.
+    // Per-solid tolerances are computed lazily per thread in AlgoCache (keeps ABI stable).
+    std::call_once(sRecordInitFlag, &G4StepSolid::InitRecorderOnce);
+
     CalcBBox();
     BuildFaceWeights();
 }
@@ -230,11 +376,13 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
                                          G4ThreeVector* n) const
 {
     if (validNorm) *validNorm = false;
-    if (v.mag2() < fTolerance * fTolerance) return kInfinity;
 
     AlgoCache* algo = GetAlgo();
+    const G4double octTol = algo->occtTol;
+    if (v.mag2() < octTol * octTol) return kInfinity;
+
     gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
-    algo->intersector->Perform(ray, -fTolerance, kInfinity);
+    algo->intersector->Perform(ray, -octTol, kInfinity);
 
     if (!algo->intersector->IsDone() || algo->intersector->NbPnt() == 0)
         return (kind == BoundaryKind::Entry) ? kInfinity : 0.0;
@@ -242,13 +390,26 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     const bool wantExit = (kind == BoundaryKind::Exit);
     const char* fnName  = wantExit ? "DistanceToOut" : "DistanceToIn";
 
+    // Surface band for the solid owning a hit group (per-solid tolerance).
+    auto bandOf = [&](const HitGroup& g) -> G4double {
+        int idx = (g.firstOutIdx >= 0) ? g.firstOutIdx : g.anyIdx;
+        int si  = (idx >= 0) ? algo->FaceToSolid(algo->intersector->Face(idx)) : -1;
+        return algo->SolidBand(si);
+    };
+
     auto isBoundaryGroup = [&](const HitGroup& g) -> bool {
         int net = wantExit ? (g.nOut - g.nIn) : (g.nIn - g.nOut);
         if (net > 0) return true;
         if (net < 0) return false;
-        G4ThreeVector probe = p + (g.dist + fTolerance * kProbeMultiplier) * v;
-        algo->classifier->Perform(G4toOCCT(probe), fTolerance);
-        bool probeOutside = (algo->classifier->State() == TopAbs_OUT);
+        G4ThreeVector probe = p + (g.dist + octTol * kProbeMultiplier) * v;
+        bool probeInside = false, probeOn = false;
+        for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
+            algo->solidClassifiers[i]->Perform(G4toOCCT(probe), algo->SolidBand((int)i));
+            auto s = algo->solidClassifiers[i]->State();
+            if (s == TopAbs_IN) { probeInside = true; break; }
+            if (s == TopAbs_ON) probeOn = true;
+        }
+        bool probeOutside = !probeInside && !probeOn;
         if (fVerboseLevel >= 2) {
             G4cout << "[G4StepSolid::" << GetName() << "] coincident-face probe"
                    << " dist=" << g.dist
@@ -258,10 +419,11 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         return wantExit ? probeOutside : !probeOutside;
     };
 
-    for (const auto& g : GroupHits(algo->intersector, fTolerance)) {
+    for (const auto& g : GroupHits(algo->intersector, octTol)) {
         if (!isBoundaryGroup(g)) continue;
 
-        if (std::abs(g.dist) < fTolerance) {
+        const G4double band = bandOf(g);  // per-solid surface band
+        if (std::abs(g.dist) < band) {
             if (calcNorm && validNorm && g.firstOutIdx >= 0) {
                 *n = GetNormalAtIntersection(g.firstOutIdx, algo);
                 *validNorm = true;
@@ -270,11 +432,11 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
                 G4cout << "[G4StepSolid::" << GetName() << "::" << fnName << "][local]"
                        << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                        << " v=(" << v.x() << "," << v.y() << "," << v.z() << ")"
-                       << " -> 0.0 (on boundary)" << G4endl;
+                       << " -> 0.0 (on boundary, band=" << band << ")" << G4endl;
             }
             return 0.0;
         }
-        if (g.dist > fTolerance) {
+        if (g.dist > band) {
             if (calcNorm && validNorm && g.firstOutIdx >= 0) {
                 *n = GetNormalAtIntersection(g.firstOutIdx, algo);
                 *validNorm = true;
@@ -314,12 +476,13 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
     }
 
     AlgoCache* algo = GetAlgo();
-    algo->classifier->Perform(G4toOCCT(p), fTolerance);
-    TopAbs_State state = algo->classifier->State();
-
-    EInside result = (state == TopAbs_IN)  ? kInside
-                   : (state == TopAbs_OUT) ? kOutside
-                   :                         kSurface;
+    EInside result = kOutside;
+    for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
+        algo->solidClassifiers[i]->Perform(G4toOCCT(p), algo->SolidBand((int)i));
+        auto s = algo->solidClassifiers[i]->State();
+        if (s == TopAbs_IN) { result = kInside; break; }
+        if (s == TopAbs_ON) result = kSurface;
+    }
 
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::Inside][local]"
@@ -327,6 +490,8 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
                << " -> " << (result==kInside?"kInside":result==kOutside?"kOutside":"kSurface")
                << G4endl;
     }
+    if (sRecordEnabled)
+        RecordQuery(QueryType::Inside, p, G4ThreeVector(0,0,0), result, 0.0, -1);
     return result;
 }
 
@@ -334,7 +499,10 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
 // DistanceToIn
 // ====================================================================
 G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
-    return RayCastToBoundary(p, v, BoundaryKind::Entry);
+    G4double result = RayCastToBoundary(p, v, BoundaryKind::Entry);
+    if (sRecordEnabled)
+        RecordQuery(QueryType::DistToIn, p, v, 0, result, -1);
+    return result;
 }
 
 G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
@@ -370,7 +538,14 @@ G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
 G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
                                     const G4bool calcNorm, G4bool* validNorm,
                                     G4ThreeVector* n) const {
-    return RayCastToBoundary(p, v, BoundaryKind::Exit, calcNorm, validNorm, n);
+    G4double result = RayCastToBoundary(p, v, BoundaryKind::Exit, calcNorm, validNorm, n);
+    if (sRecordEnabled) {
+        // Rigorous stuck signature needs Inside(p): a real loop is
+        // Inside==kInside AND DistanceToOut≈0 (thinks it's in, can't get out).
+        int insideAtP = Inside(p);
+        RecordQuery(QueryType::DistToOut, p, v, 0, result, insideAtP);
+    }
+    return result;
 }
 
 G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
@@ -579,6 +754,9 @@ G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
     }
     return poly;
 }
+
+void G4StepSolid::SetTimingEnabled(G4bool) {}
+void G4StepSolid::PrintAllTimingReports() {}
 
 std::ostream& G4StepSolid::StreamInfo(std::ostream& os) const {
     os << "G4StepSolid: " << GetName()
