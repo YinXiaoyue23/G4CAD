@@ -145,6 +145,7 @@ int G4StepSolid::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
 
 G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                                    const G4StepSolid* ownerSolid)
+    : owner(ownerSolid)
 {
     requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
 

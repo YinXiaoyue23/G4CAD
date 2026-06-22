@@ -22,6 +22,8 @@ class BRepExtrema_DistShapeShape;
 #include <mutex>
 #include <memory>
 #include <fstream>
+#include <chrono>
+#include <cstdint>
 
 class G4StepSolid : public G4VSolid {
 public:
@@ -39,6 +41,13 @@ public:
     // 2 = per-call geometry tracing (Inside, DistanceToIn/Out, ...)
     void   SetVerboseLevel(G4int level) { fVerboseLevel = level; }
     G4int  GetVerboseLevel() const      { return fVerboseLevel; }
+
+    // --- Per-call timing (disabled by default; zero overhead when off) ---
+    // When enabled, a per-function summary is printed automatically at process exit.
+    void   SetTimingEnabled(G4bool enable);
+    G4bool GetTimingEnabled() const { return fTimingEnabled; }
+    void   PrintTimingReport() const;
+    static void PrintAllTimingReports();
 
     // --- Geant4 core geometry interface ---
     virtual EInside Inside(const G4ThreeVector& p) const override;
@@ -65,6 +74,7 @@ public:
 
 private:
     G4int  fVerboseLevel  = 0;
+    G4bool fTimingEnabled = false;
 
     // Read-only geometry data, shared across all threads
     TopoDS_Shape fShape;
@@ -85,6 +95,16 @@ private:
     };
     std::vector<FaceEntry> fFaces;
     std::vector<G4double>  fCumulativeArea; // prefix sum of face areas
+
+    // Per-thread accumulated timing (one per thread per solid, lock-free accumulation)
+    struct TimingStats {
+        int64_t insideNs    = 0, insideCount    = 0;
+        int64_t dtiVecNs    = 0, dtiVecCount    = 0;
+        int64_t dtiScalNs   = 0, dtiScalCount   = 0;
+        int64_t dtoVecNs    = 0, dtoVecCount    = 0;
+        int64_t dtoScalNs   = 0, dtoScalCount   = 0;
+        int64_t normalNs    = 0, normalCount     = 0;
+    };
 
     // Thread-local OCCT algorithm objects
     struct AlgoCache {
@@ -112,6 +132,9 @@ private:
         G4double                       occtTol      = 1e-7;
         bool                           perSolidTol  = true;
 
+        TimingStats         timing;
+        const G4StepSolid*  owner = nullptr;
+
         AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                   const G4StepSolid* ownerSolid);
         ~AlgoCache();
@@ -128,6 +151,13 @@ private:
     // Global registry for destroying all per-thread AlgoCaches on object destruction
     static std::vector<AlgoCache*> sAllCaches;
     static std::mutex               sAllCachesMutex;
+
+    // Registry of solids with timing enabled (for atexit summary report)
+    static std::vector<const G4StepSolid*> sTimedSolids;
+    static std::mutex                       sTimedSolidsMutex;
+    static std::once_flag                   sAtexitFlag;
+
+    using Clock = std::chrono::high_resolution_clock;
 
     // --- Query recorder (env-var gated, zero cost when off) ---
     // Enable with  G4CAD_RECORD=/path/queries.csv  (optionally G4CAD_RECORD_EVENT=N).
