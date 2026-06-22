@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <vector>
 
 namespace {
@@ -99,8 +100,12 @@ namespace {
 // ====================================================================
 // Static member definitions
 // ====================================================================
-std::vector<G4StepSolid::AlgoCache*> G4StepSolid::sAllCaches;
-std::mutex                            G4StepSolid::sAllCachesMutex;
+std::vector<G4StepSolid::AlgoCache*>    G4StepSolid::sAllCaches;
+std::mutex                               G4StepSolid::sAllCachesMutex;
+
+std::vector<const G4StepSolid*>         G4StepSolid::sTimedSolids;
+std::mutex                               G4StepSolid::sTimedSolidsMutex;
+std::once_flag                           G4StepSolid::sAtexitFlag;
 
 // Query recorder (debug-only)
 bool           G4StepSolid::sRecordEnabled   = false;
@@ -198,7 +203,10 @@ void G4StepSolid::RecordQuery(QueryType type, const G4ThreeVector& p,
 // ====================================================================
 // AlgoCache
 // ====================================================================
-G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance) {
+G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
+                                   const G4StepSolid* ownerSolid)
+    : owner(ownerSolid)
+{
     requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
 
     // Per-solid toggle. Default OFF (global single tolerance) — empirically the dev
@@ -270,6 +278,7 @@ G4StepSolid::~G4StepSolid() {
 
 G4StepSolid::G4StepSolid(const G4StepSolid& rhs)
     : G4VSolid(rhs), fVerboseLevel(rhs.fVerboseLevel),
+      fTimingEnabled(rhs.fTimingEnabled),
       fShape(rhs.fShape),
       fXmin(rhs.fXmin), fXmax(rhs.fXmax),
       fYmin(rhs.fYmin), fYmax(rhs.fYmax),
@@ -285,6 +294,7 @@ G4StepSolid& G4StepSolid::operator=(const G4StepSolid& rhs) {
     if (this == &rhs) return *this;
     G4VSolid::operator=(rhs);
     fVerboseLevel   = rhs.fVerboseLevel;
+    fTimingEnabled  = rhs.fTimingEnabled;
     fShape          = rhs.fShape;
     fXmin = rhs.fXmin; fXmax = rhs.fXmax;
     fYmin = rhs.fYmin; fYmax = rhs.fYmax;
@@ -347,7 +357,7 @@ void G4StepSolid::BuildFaceWeights() {
 G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
     AlgoCache* algo = fAlgoCache.Get();
     if (!algo) {
-        algo = new AlgoCache(fShape, fTolerance);
+        algo = new AlgoCache(fShape, fTolerance, this);
         fAlgoCache.Put(algo);
         std::lock_guard<std::mutex> lock(sAllCachesMutex);
         sAllCaches.push_back(algo);
@@ -463,10 +473,18 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 // Inside
 // ====================================================================
 EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
+    AlgoCache* algo = nullptr;
+    Clock::time_point t0;
+    if (fTimingEnabled) { algo = GetAlgo(); t0 = Clock::now(); }
+
     if (p.x() < fXmin || p.x() > fXmax ||
         p.y() < fYmin || p.y() > fYmax ||
         p.z() < fZmin || p.z() > fZmax)
     {
+        if (fTimingEnabled) {
+            algo->timing.insideNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.insideCount;
+        }
         if (fVerboseLevel >= 2) {
             G4cout << "[G4StepSolid::" << GetName() << "::Inside][local]"
                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -475,7 +493,7 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
         return kOutside;
     }
 
-    AlgoCache* algo = GetAlgo();
+    if (!algo) algo = GetAlgo();
     EInside result = kOutside;
     for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
         algo->solidClassifiers[i]->Perform(G4toOCCT(p), algo->SolidBand((int)i));
@@ -484,6 +502,10 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
         if (s == TopAbs_ON) result = kSurface;
     }
 
+    if (fTimingEnabled) {
+        algo->timing.insideNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.insideCount;
+    }
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::Inside][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -499,18 +521,31 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
 // DistanceToIn
 // ====================================================================
 G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
     G4double result = RayCastToBoundary(p, v, BoundaryKind::Entry);
+    if (fTimingEnabled) {
+        AlgoCache* algo = GetAlgo();
+        algo->timing.dtiVecNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtiVecCount;
+    }
     if (sRecordEnabled)
         RecordQuery(QueryType::DistToIn, p, v, 0, result, -1);
     return result;
 }
 
 G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
+    AlgoCache* algo = fTimingEnabled ? GetAlgo() : nullptr;
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
+
     G4double dx = std::max({fXmin - p.x(), p.x() - fXmax, 0.0});
     G4double dy = std::max({fYmin - p.y(), p.y() - fYmax, 0.0});
     G4double dz = std::max({fZmin - p.z(), p.z() - fZmax, 0.0});
     G4double bboxDist = std::sqrt(dx*dx + dy*dy + dz*dz);
     if (bboxDist > 0.0) {
+        if (fTimingEnabled) {
+            algo->timing.dtiScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.dtiScalCount;
+        }
         if (fVerboseLevel >= 2) {
             G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -524,6 +559,10 @@ G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
     extrema.LoadS2(fShape);
     extrema.Perform();
     G4double result = extrema.IsDone() ? extrema.Value() : 0.0;
+    if (fTimingEnabled) {
+        algo->timing.dtiScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtiScalCount;
+    }
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -538,10 +577,15 @@ G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
 G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
                                     const G4bool calcNorm, G4bool* validNorm,
                                     G4ThreeVector* n) const {
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
     G4double result = RayCastToBoundary(p, v, BoundaryKind::Exit, calcNorm, validNorm, n);
+    if (fTimingEnabled) {
+        AlgoCache* algo = GetAlgo();
+        algo->timing.dtoVecNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtoVecCount;
+    }
     if (sRecordEnabled) {
-        // Rigorous stuck signature needs Inside(p): a real loop is
-        // Inside==kInside AND DistanceToOut≈0 (thinks it's in, can't get out).
+        // Rigorous stuck signature: Inside==kInside AND DistanceToOut≈0.
         int insideAtP = Inside(p);
         RecordQuery(QueryType::DistToOut, p, v, 0, result, insideAtP);
     }
@@ -549,7 +593,14 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector&
 }
 
 G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
+    AlgoCache* algo = fTimingEnabled ? GetAlgo() : nullptr;
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
+
     if (Inside(p) == kOutside) {
+        if (fTimingEnabled) {
+            algo->timing.dtoScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.dtoScalCount;
+        }
         if (fVerboseLevel >= 2) {
             G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -563,6 +614,10 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
     extrema.LoadS2(fShape);
     extrema.Perform();
     G4double result = extrema.IsDone() ? extrema.Value() : 0.0;
+    if (fTimingEnabled) {
+        algo->timing.dtoScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtoScalCount;
+    }
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -575,11 +630,18 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
 // SurfaceNormal
 // ====================================================================
 G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
+    AlgoCache* algo = fTimingEnabled ? GetAlgo() : nullptr;
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
+
     BRepExtrema_DistShapeShape extrema;
     extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
     extrema.LoadS2(fShape);
     extrema.Perform();
     if (!extrema.IsDone() || extrema.NbSolution() == 0) {
+        if (fTimingEnabled) {
+            algo->timing.normalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.normalCount;
+        }
         if (fVerboseLevel >= 2) {
             G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
                    << " no solution -> (0,0,1)" << G4endl;
@@ -607,6 +669,10 @@ G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
         result = (dir.mag2() > 0) ? dir.unit() : G4ThreeVector(0, 0, 1);
     }
 
+    if (fTimingEnabled) {
+        algo->timing.normalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.normalCount;
+    }
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -755,8 +821,66 @@ G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
     return poly;
 }
 
-void G4StepSolid::SetTimingEnabled(G4bool) {}
-void G4StepSolid::PrintAllTimingReports() {}
+// ====================================================================
+// Timing
+// ====================================================================
+void G4StepSolid::SetTimingEnabled(G4bool enable) {
+    fTimingEnabled = enable;
+    if (!enable) return;
+    {
+        std::lock_guard<std::mutex> lock(sTimedSolidsMutex);
+        if (std::find(sTimedSolids.begin(), sTimedSolids.end(), this) == sTimedSolids.end())
+            sTimedSolids.push_back(this);
+    }
+    // Register atexit handler once so the report is always printed at exit.
+    std::call_once(sAtexitFlag, []{ std::atexit(G4StepSolid::PrintAllTimingReports); });
+}
+
+namespace {
+    void PrintTimingRow(const char* name, int64_t ns, int64_t count) {
+        if (count == 0) return;
+        G4cout << "  " << std::left << std::setw(24) << name
+               << std::right << std::setw(10) << count << " calls"
+               << std::setw(12) << (ns / count) << " ns/call"
+               << std::setw(12) << (ns / 1000) << " µs total"
+               << G4endl;
+    }
+}
+
+void G4StepSolid::PrintTimingReport() const {
+    TimingStats total;
+    {
+        std::lock_guard<std::mutex> lock(sAllCachesMutex);
+        for (const AlgoCache* c : sAllCaches) {
+            if (c->owner != this) continue;
+            total.insideNs    += c->timing.insideNs;
+            total.insideCount += c->timing.insideCount;
+            total.dtiVecNs    += c->timing.dtiVecNs;
+            total.dtiVecCount += c->timing.dtiVecCount;
+            total.dtiScalNs   += c->timing.dtiScalNs;
+            total.dtiScalCount+= c->timing.dtiScalCount;
+            total.dtoVecNs    += c->timing.dtoVecNs;
+            total.dtoVecCount += c->timing.dtoVecCount;
+            total.dtoScalNs   += c->timing.dtoScalNs;
+            total.dtoScalCount+= c->timing.dtoScalCount;
+            total.normalNs    += c->timing.normalNs;
+            total.normalCount += c->timing.normalCount;
+        }
+    }
+    G4cout << "[G4StepSolid timing] " << GetName() << G4endl;
+    PrintTimingRow("Inside",              total.insideNs,   total.insideCount);
+    PrintTimingRow("DistanceToIn(p,v)",   total.dtiVecNs,   total.dtiVecCount);
+    PrintTimingRow("DistanceToIn(p)",     total.dtiScalNs,  total.dtiScalCount);
+    PrintTimingRow("DistanceToOut(p,v)",  total.dtoVecNs,   total.dtoVecCount);
+    PrintTimingRow("DistanceToOut(p)",    total.dtoScalNs,  total.dtoScalCount);
+    PrintTimingRow("SurfaceNormal",       total.normalNs,   total.normalCount);
+}
+
+void G4StepSolid::PrintAllTimingReports() {
+    std::lock_guard<std::mutex> lock(sTimedSolidsMutex);
+    for (const G4StepSolid* s : sTimedSolids)
+        s->PrintTimingReport();
+}
 
 std::ostream& G4StepSolid::StreamInfo(std::ostream& os) const {
     os << "G4StepSolid: " << GetName()

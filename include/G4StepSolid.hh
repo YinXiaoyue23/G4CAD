@@ -17,6 +17,8 @@
 #include <mutex>
 #include <memory>
 #include <fstream>
+#include <chrono>
+#include <cstdint>
 
 class G4StepSolid : public G4VSolid {
 public:
@@ -34,7 +36,12 @@ public:
     // 2 = per-call geometry tracing (Inside, DistanceToIn/Out, ...)
     void   SetVerboseLevel(G4int level) { fVerboseLevel = level; }
     G4int  GetVerboseLevel() const      { return fVerboseLevel; }
-    void   SetTimingEnabled(G4bool);
+
+    // --- Per-call timing (disabled by default; zero overhead when off) ---
+    // When enabled, a per-function summary is printed automatically at process exit.
+    void   SetTimingEnabled(G4bool enable);
+    G4bool GetTimingEnabled() const { return fTimingEnabled; }
+    void   PrintTimingReport() const;
     static void PrintAllTimingReports();
 
     // --- Geant4 core geometry interface ---
@@ -61,15 +68,13 @@ public:
     virtual G4ThreeVector GetPointOnSurface() const override;
 
 private:
-    G4int fVerboseLevel = 0;
+    G4int  fVerboseLevel  = 0;
+    G4bool fTimingEnabled = false;
 
     // Read-only geometry data, shared across all threads
     TopoDS_Shape fShape;
     G4double fXmin, fXmax, fYmin, fYmax, fZmin, fZmax;
-    G4double fTolerance;          // requested tolerance (from ctor / yaml)
-    // NOTE: per-solid tolerance state lives in AlgoCache (below), NOT here — adding
-    // non-static members to G4StepSolid would change sizeof and break ABI with
-    // libGeometry, which does `new G4StepSolid(...)` against this header.
+    G4double fTolerance;
 
     // For GetPointOnSurface: precomputed at construction, read-only at runtime, lock-free
     struct FaceEntry {
@@ -79,6 +84,16 @@ private:
     std::vector<FaceEntry> fFaces;
     std::vector<G4double>  fCumulativeArea; // prefix sum of face areas
 
+    // Per-thread accumulated timing (one per thread per solid, lock-free accumulation)
+    struct TimingStats {
+        int64_t insideNs    = 0, insideCount    = 0;
+        int64_t dtiVecNs    = 0, dtiVecCount    = 0;
+        int64_t dtiScalNs   = 0, dtiScalCount   = 0;
+        int64_t dtoVecNs    = 0, dtoVecCount    = 0;
+        int64_t dtoScalNs   = 0, dtoScalCount   = 0;
+        int64_t normalNs    = 0, normalCount     = 0;
+    };
+
     // Thread-local OCCT algorithm objects
     struct AlgoCache {
         // Per-solid classifiers: point is inside the assembly if inside ANY solid.
@@ -87,7 +102,7 @@ private:
         std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> solidClassifiers;
         IntCurvesFace_ShapeIntersector* intersector = nullptr;
 
-        // --- Per-solid tolerance (Part B), kept here so G4StepSolid's ABI is unchanged ---
+        // --- Per-solid tolerance ---
         // Each solid carries geometric noise σ_i (max BRep tol over its faces/edges/vertices).
         // A clean solid gets a tight surface band; a noisy one (RP.step #5/#6) gets 2σ_i so
         // Inside()/DistanceToOut() stay self-consistent.
@@ -101,7 +116,11 @@ private:
         G4double                       occtTol      = 1e-7;
         bool                           perSolidTol  = true;
 
-        AlgoCache(const TopoDS_Shape& shape, G4double tolerance);
+        TimingStats         timing;
+        const G4StepSolid*  owner = nullptr;
+
+        AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
+                  const G4StepSolid* ownerSolid);
         ~AlgoCache();
 
         int      FaceToSolid(const TopoDS_Face& f) const;  // -1 if not found
@@ -116,6 +135,13 @@ private:
     // Global registry for destroying all per-thread AlgoCaches on object destruction
     static std::vector<AlgoCache*> sAllCaches;
     static std::mutex               sAllCachesMutex;
+
+    // Registry of solids with timing enabled (for atexit summary report)
+    static std::vector<const G4StepSolid*> sTimedSolids;
+    static std::mutex                       sTimedSolidsMutex;
+    static std::once_flag                   sAtexitFlag;
+
+    using Clock = std::chrono::high_resolution_clock;
 
     // --- Query recorder (env-var gated, zero cost when off) ---
     // Enable with  G4CAD_RECORD=/path/queries.csv  (optionally G4CAD_RECORD_EVENT=N).
