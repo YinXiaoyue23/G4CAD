@@ -10,8 +10,11 @@
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Face.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
-#include <IntCurvesFace_ShapeIntersector.hxx>
+#include <IntCurvesFace_Intersector.hxx>
 #include <TopTools_DataMapOfShapeInteger.hxx>
+#include <Bnd_Box.hxx>
+#include <gp_Pnt.hxx>
+#include <TopoDS_Face.hxx>
 
 #include <vector>
 #include <mutex>
@@ -34,8 +37,6 @@ public:
     // 2 = per-call geometry tracing (Inside, DistanceToIn/Out, ...)
     void   SetVerboseLevel(G4int level) { fVerboseLevel = level; }
     G4int  GetVerboseLevel() const      { return fVerboseLevel; }
-    void   SetTimingEnabled(G4bool);
-    static void PrintAllTimingReports();
 
     // --- Geant4 core geometry interface ---
     virtual EInside Inside(const G4ThreeVector& p) const override;
@@ -61,20 +62,24 @@ public:
     virtual G4ThreeVector GetPointOnSurface() const override;
 
 private:
-    G4int fVerboseLevel = 0;
+    G4int  fVerboseLevel  = 0;
 
     // Read-only geometry data, shared across all threads
     TopoDS_Shape fShape;
     G4double fXmin, fXmax, fYmin, fYmax, fZmin, fZmax;
-    G4double fTolerance;          // requested tolerance (from ctor / yaml)
-    // NOTE: per-solid tolerance state lives in AlgoCache (below), NOT here — adding
-    // non-static members to G4StepSolid would change sizeof and break ABI with
-    // libGeometry, which does `new G4StepSolid(...)` against this header.
+    G4double fTolerance;
 
     // For GetPointOnSurface: precomputed at construction, read-only at runtime, lock-free
     struct FaceEntry {
         TopoDS_Face face;
+        Bnd_Box     bbox;
         G4double u0, u1, v0, v1;
+    };
+
+    struct NearestFaceResult {
+        G4double dist   = kInfinity;
+        int      idx    = -1;
+        gp_Pnt   pOnFace;
     };
     std::vector<FaceEntry> fFaces;
     std::vector<G4double>  fCumulativeArea; // prefix sum of face areas
@@ -85,9 +90,10 @@ private:
         // Using individual solids avoids BRepClass3d_SolidClassifier's known misclassification
         // of points near assembly joints when applied to a compound shape.
         std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> solidClassifiers;
-        IntCurvesFace_ShapeIntersector* intersector = nullptr;
+        std::vector<Bnd_Box>                                       solidBoxes;
+        std::vector<IntCurvesFace_Intersector*>                    faceIntersectors;
 
-        // --- Per-solid tolerance (Part B), kept here so G4StepSolid's ABI is unchanged ---
+        // --- Per-solid tolerance ---
         // Each solid carries geometric noise σ_i (max BRep tol over its faces/edges/vertices).
         // A clean solid gets a tight surface band; a noisy one (RP.step #5/#6) gets 2σ_i so
         // Inside()/DistanceToOut() stay self-consistent.
@@ -101,7 +107,8 @@ private:
         G4double                       occtTol      = 1e-7;
         bool                           perSolidTol  = true;
 
-        AlgoCache(const TopoDS_Shape& shape, G4double tolerance);
+        AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
+                  const G4StepSolid* ownerSolid);
         ~AlgoCache();
 
         int      FaceToSolid(const TopoDS_Face& f) const;  // -1 if not found
@@ -140,7 +147,8 @@ private:
     void CalcBBox();
     void BuildFaceWeights();
     AlgoCache* GetAlgo() const;
-    G4ThreeVector GetNormalAtIntersection(int index, const AlgoCache* algo) const;
+    NearestFaceResult NearestFace(const gp_Pnt& pt) const;
+    G4ThreeVector GetNormalAtIntersection(const TopoDS_Face& face, G4double u, G4double v) const;
 
     // Unified ray-boundary helper used by both DistanceToIn(p,v) and DistanceToOut(p,v).
     enum class BoundaryKind { Entry, Exit };

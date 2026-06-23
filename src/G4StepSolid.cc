@@ -33,10 +33,13 @@
 #include <gp_Lin.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Dir.hxx>
+#include <IntCurvesFace_Intersector.hxx>
+#include <TopoDS_Face.hxx>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <vector>
 
 namespace {
@@ -46,45 +49,60 @@ namespace {
 
     G4Mutex polyhedronMutex = G4MUTEX_INITIALIZER;
 
-    struct HitGroup {
-        G4double dist;
-        int      nIn  = 0;
-        int      nOut = 0;
-        int      firstOutIdx = -1;
-        int      anyIdx      = -1;  // any hit index in this group (for face→solid lookup)
+    struct RayHit {
+        G4double                          w;
+        IntCurveSurface_TransitionOnCurve trans;
+        TopoDS_Face                       face;
+        G4double                          u, v;
+        RayHit(G4double w_, IntCurveSurface_TransitionOnCurve t,
+               const TopoDS_Face& f, G4double u_, G4double v_)
+            : w(w_), trans(t), face(f), u(u_), v(v_) {}
     };
 
-    std::vector<HitGroup> GroupHits(const IntCurvesFace_ShapeIntersector* isect,
-                                    G4double tol)
-    {
-        int n = isect->NbPnt();
-        if (n == 0) return {};
+    struct HitGroup {
+        G4double    dist;
+        int         nIn     = 0;
+        int         nOut    = 0;
+        TopoDS_Face outFace;       // first Out-transition face (for normal + band)
+        G4double    outU    = 0;
+        G4double    outV    = 0;
+        TopoDS_Face anyFace;       // first any-transition face (fallback for band)
+    };
 
-        std::vector<std::pair<G4double,int>> raw;
-        raw.reserve(n);
-        for (int i = 1; i <= n; ++i)
-            raw.push_back({isect->WParameter(i), i});
-        std::sort(raw.begin(), raw.end(),
-                  [](const auto& a, const auto& b){ return a.first < b.first; });
+    // Takes hits by value so we can sort in place.
+    std::vector<HitGroup> GroupHits(std::vector<RayHit> hits, G4double tol) {
+        if (hits.empty()) return {};
+        std::sort(hits.begin(), hits.end(),
+                  [](const RayHit& a, const RayHit& b){ return a.w < b.w; });
 
         std::vector<HitGroup> groups;
-        for (auto& [d, idx] : raw) {
-            auto trans = isect->Transition(idx);
+        for (const RayHit& h : hits) {
             // Tangent intersections do not cross the boundary; skip them.
-            // Counting a tangent as In or Out would corrupt the net crossing count.
-            if (trans == IntCurveSurface_Tangent) continue;
-            if (!groups.empty() && d - groups.back().dist < tol) {
-                if (trans == IntCurveSurface_In) groups.back().nIn++;
-                else {
+            if (h.trans == IntCurveSurface_Tangent) continue;
+            if (!groups.empty() && h.w - groups.back().dist < tol) {
+                if (h.trans == IntCurveSurface_In) {
+                    groups.back().nIn++;
+                } else {
                     groups.back().nOut++;
-                    if (groups.back().firstOutIdx < 0) groups.back().firstOutIdx = idx;
+                    if (groups.back().outFace.IsNull()) {
+                        groups.back().outFace = h.face;
+                        groups.back().outU    = h.u;
+                        groups.back().outV    = h.v;
+                    }
                 }
+                if (groups.back().anyFace.IsNull()) groups.back().anyFace = h.face;
             } else {
                 HitGroup g;
-                g.dist = d;
-                g.anyIdx = idx;
-                if (trans == IntCurveSurface_In) { g.nIn = 1; }
-                else { g.nOut = 1; g.firstOutIdx = idx; }
+                g.dist    = h.w;
+                g.anyFace = h.face;
+                if (h.trans == IntCurveSurface_In) {
+                    g.nIn = 1;
+                } else {
+                    g.nOut    = 1;
+                    g.outFace = h.face;
+                    g.outU    = h.u;
+                    g.outV    = h.v;
+                }
                 groups.push_back(g);
             }
         }
@@ -94,13 +112,52 @@ namespace {
     inline gp_Pnt       G4toOCCT(const G4ThreeVector& v) { return gp_Pnt(v.x(), v.y(), v.z()); }
     inline G4ThreeVector OCCTtoG4(const gp_Dir& v)       { return G4ThreeVector(v.X(), v.Y(), v.Z()); }
     inline G4ThreeVector OCCTtoG4(const gp_Pnt& v)       { return G4ThreeVector(v.X(), v.Y(), v.Z()); }
+
+    // Minimum possible distance from a point to an axis-aligned bounding box.
+    // Returns 0 if the point is inside the box.
+    inline G4double BBoxPointDist(const Bnd_Box& box, const gp_Pnt& p) {
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        double dx = std::max({xmin - p.X(), p.X() - xmax, 0.0});
+        double dy = std::max({ymin - p.Y(), p.Y() - ymax, 0.0});
+        double dz = std::max({zmin - p.Z(), p.Z() - zmax, 0.0});
+        return std::sqrt(dx*dx + dy*dy + dz*dz);
+    }
+
+    // Slab test: true if the ray (orig, invDir = 1/dir) could intersect the box
+    // for W >= -wMin (wMin matches the back-search tolerance from Perform's first arg).
+    // Uses IEEE arithmetic — 1/0 = ±inf is handled correctly.
+    inline bool rayHitsBox(const gp_Pnt& orig, const gp_Vec& invDir,
+                           const Bnd_Box& box, G4double wMin) {
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        // Expand spatially by wMin to catch near-miss cases at face boundaries.
+        xmin -= wMin; ymin -= wMin; zmin -= wMin;
+        xmax += wMin; ymax += wMin; zmax += wMin;
+
+        double tx0 = (xmin - orig.X()) * invDir.X();
+        double tx1 = (xmax - orig.X()) * invDir.X();
+        double tEnter = std::min(tx0, tx1), tExit = std::max(tx0, tx1);
+
+        double ty0 = (ymin - orig.Y()) * invDir.Y();
+        double ty1 = (ymax - orig.Y()) * invDir.Y();
+        tEnter = std::max(tEnter, std::min(ty0, ty1));
+        tExit  = std::min(tExit,  std::max(ty0, ty1));
+
+        double tz0 = (zmin - orig.Z()) * invDir.Z();
+        double tz1 = (zmax - orig.Z()) * invDir.Z();
+        tEnter = std::max(tEnter, std::min(tz0, tz1));
+        tExit  = std::min(tExit,  std::max(tz0, tz1));
+
+        return tEnter <= tExit && tExit >= -wMin;
+    }
 } // namespace
 
 // ====================================================================
 // Static member definitions
 // ====================================================================
-std::vector<G4StepSolid::AlgoCache*> G4StepSolid::sAllCaches;
-std::mutex                            G4StepSolid::sAllCachesMutex;
+std::vector<G4StepSolid::AlgoCache*>    G4StepSolid::sAllCaches;
+std::mutex                               G4StepSolid::sAllCachesMutex;
 
 // Query recorder (debug-only)
 bool           G4StepSolid::sRecordEnabled   = false;
@@ -198,7 +255,9 @@ void G4StepSolid::RecordQuery(QueryType type, const G4ThreeVector& p,
 // ====================================================================
 // AlgoCache
 // ====================================================================
-G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance) {
+G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
+                                   const G4StepSolid* ownerSolid)
+{
     requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
 
     // Per-solid toggle. Default OFF (global single tolerance) — empirically the dev
@@ -218,6 +277,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance)
         G4double band  = std::max(requestedTol, 2.0 * sigma);  // self-consistency: band >= 2σ
         solidTol.push_back(band);
         globalMax = std::max(globalMax, band);
+        { Bnd_Box b; BRepBndLib::Add(s, b); b.Enlarge(band); solidBoxes.push_back(b); }
         for (TopExp_Explorer fe(s, TopAbs_FACE); fe.More(); fe.Next())
             if (!faceSolidMap.IsBound(fe.Current()))
                 faceSolidMap.Bind(fe.Current(), si);
@@ -225,6 +285,11 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance)
     // Global mode: OCCT search/grouping uses plain requested tol (pure "current dev").
     occtTol = perSolidTol ? globalMax : requestedTol;
     if (solidTol.empty()) { solidTol.push_back(requestedTol); occtTol = requestedTol; }
+
+    // Per-face intersectors — same class as IntCurvesFace_ShapeIntersector uses internally,
+    // so transition semantics are identical. Built once per thread; reused across ray casts.
+    for (const auto& fe : ownerSolid->fFaces)
+        faceIntersectors.push_back(new IntCurvesFace_Intersector(fe.face, occtTol));
 
     // One-time tolerance table (env G4CAD_TOL_VERBOSE), to confirm which solids got widened.
     static std::once_flag tolPrintFlag;
@@ -238,12 +303,10 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance)
             G4cout << G4endl;
         });
 
-    intersector = new IntCurvesFace_ShapeIntersector();
-    intersector->Load(shape, occtTol);
 }
 
 G4StepSolid::AlgoCache::~AlgoCache() {
-    delete intersector;
+    for (auto* p : faceIntersectors) delete p;
 }
 
 // ====================================================================
@@ -322,6 +385,7 @@ void G4StepSolid::BuildFaceWeights() {
     fCumulativeArea.clear();
     G4double cumArea = 0.0;
 
+    std::map<GeomAbs_SurfaceType, int> typeCount;
     for (TopExp_Explorer ex(fShape, TopAbs_FACE); ex.More(); ex.Next()) {
         TopoDS_Face face = TopoDS::Face(ex.Current());
 
@@ -331,23 +395,37 @@ void G4StepSolid::BuildFaceWeights() {
         if (area <= 0.0) continue;
 
         BRepAdaptor_Surface surf(face);
+        GeomAbs_SurfaceType st = surf.GetType();
+        typeCount[st]++;
+
         FaceEntry fe;
         fe.face = face;
-        fe.u0   = surf.FirstUParameter();
-        fe.u1   = surf.LastUParameter();
-        fe.v0   = surf.FirstVParameter();
-        fe.v1   = surf.LastVParameter();
+        BRepBndLib::Add(face, fe.bbox);
+        fe.u0 = surf.FirstUParameter();
+        fe.u1 = surf.LastUParameter();
+        fe.v0 = surf.FirstVParameter();
+        fe.v1 = surf.LastVParameter();
+
         fFaces.push_back(fe);
 
         cumArea += area;
         fCumulativeArea.push_back(cumArea);
     }
+
+    static const char* typeName[] = {
+        "Plane","Cylinder","Cone","Sphere","Torus",
+        "Bezier","BSpline","Revolution","Extrusion","Offset","Other"
+    };
+    G4cout << "[G4StepSolid] " << GetName() << ": " << fFaces.size() << " faces — ";
+    for (auto& kv : typeCount)
+        G4cout << typeName[std::min((int)kv.first,10)] << "=" << kv.second << " ";
+    G4cout << G4endl;
 }
 
 G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
     AlgoCache* algo = fAlgoCache.Get();
     if (!algo) {
-        algo = new AlgoCache(fShape, fTolerance);
+        algo = new AlgoCache(fShape, fTolerance, this);
         fAlgoCache.Put(algo);
         std::lock_guard<std::mutex> lock(sAllCachesMutex);
         sAllCaches.push_back(algo);
@@ -355,16 +433,41 @@ G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
     return algo;
 }
 
-G4ThreeVector G4StepSolid::GetNormalAtIntersection(int index, const AlgoCache* algo) const {
-    const TopoDS_Face& face = algo->intersector->Face(index);
-    double u = algo->intersector->UParameter(index);
-    double v = algo->intersector->VParameter(index);
+G4ThreeVector G4StepSolid::GetNormalAtIntersection(const TopoDS_Face& face,
+                                                    G4double u, G4double v) const {
     BRepAdaptor_Surface surf(face);
     gp_Pnt pSurf; gp_Vec d1u, d1v;
     surf.D1(u, v, pSurf, d1u, d1v);
     gp_Vec norm = d1u.Crossed(d1v);
     if (face.Orientation() == TopAbs_REVERSED) norm.Reverse();
     return OCCTtoG4(gp_Dir(norm));
+}
+
+// ====================================================================
+// NearestFace
+// ====================================================================
+G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const {
+    NearestFaceResult result;
+    if (fFaces.empty()) return result;
+
+    // Load the query point once; iterate faces as S2 so only the shape side varies.
+    BRepExtrema_DistShapeShape extrema;
+    extrema.LoadS1(BRepBuilderAPI_MakeVertex(pt).Shape());
+
+    for (int i = 0; i < (int)fFaces.size(); ++i) {
+        // Skip faces whose bbox lower-bound already exceeds the current best.
+        if (BBoxPointDist(fFaces[i].bbox, pt) >= result.dist) continue;
+        extrema.LoadS2(fFaces[i].face);
+        extrema.Perform();
+        if (!extrema.IsDone()) continue;
+        G4double d = extrema.Value();
+        if (d < result.dist) {
+            result.dist    = d;
+            result.idx     = i;
+            result.pOnFace = extrema.PointOnShape2(1);
+        }
+    }
+    return result;
 }
 
 // ====================================================================
@@ -382,9 +485,22 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     if (v.mag2() < octTol * octTol) return kInfinity;
 
     gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
-    algo->intersector->Perform(ray, -octTol, kInfinity);
+    const gp_Vec invDir(1.0/v.x(), 1.0/v.y(), 1.0/v.z());
 
-    if (!algo->intersector->IsDone() || algo->intersector->NbPnt() == 0)
+    std::vector<RayHit> rawHits;
+    for (int fi = 0; fi < (int)fFaces.size(); ++fi) {
+        const FaceEntry& fe = fFaces[fi];
+        if (!rayHitsBox(ray.Location(), invDir, fe.bbox, octTol)) continue;
+
+        IntCurvesFace_Intersector& inter = *algo->faceIntersectors[fi];
+        inter.Perform(ray, -octTol, kInfinity);
+        for (int j = 1; j <= inter.NbPnt(); ++j) {
+            rawHits.emplace_back(inter.WParameter(j), inter.Transition(j),
+                                 fe.face, inter.UParameter(j), inter.VParameter(j));
+        }
+    }
+
+    if (rawHits.empty())
         return (kind == BoundaryKind::Entry) ? kInfinity : 0.0;
 
     const bool wantExit = (kind == BoundaryKind::Exit);
@@ -392,40 +508,23 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 
     // Surface band for the solid owning a hit group (per-solid tolerance).
     auto bandOf = [&](const HitGroup& g) -> G4double {
-        int idx = (g.firstOutIdx >= 0) ? g.firstOutIdx : g.anyIdx;
-        int si  = (idx >= 0) ? algo->FaceToSolid(algo->intersector->Face(idx)) : -1;
+        const TopoDS_Face& f = !g.outFace.IsNull() ? g.outFace : g.anyFace;
+        int si = f.IsNull() ? -1 : algo->FaceToSolid(f);
         return algo->SolidBand(si);
     };
 
     auto isBoundaryGroup = [&](const HitGroup& g) -> bool {
         int net = wantExit ? (g.nOut - g.nIn) : (g.nIn - g.nOut);
-        if (net > 0) return true;
-        if (net < 0) return false;
-        G4ThreeVector probe = p + (g.dist + octTol * kProbeMultiplier) * v;
-        bool probeInside = false, probeOn = false;
-        for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
-            algo->solidClassifiers[i]->Perform(G4toOCCT(probe), algo->SolidBand((int)i));
-            auto s = algo->solidClassifiers[i]->State();
-            if (s == TopAbs_IN) { probeInside = true; break; }
-            if (s == TopAbs_ON) probeOn = true;
-        }
-        bool probeOutside = !probeInside && !probeOn;
-        if (fVerboseLevel >= 2) {
-            G4cout << "[G4StepSolid::" << GetName() << "] coincident-face probe"
-                   << " dist=" << g.dist
-                   << " -> " << (probeOutside ? "real boundary" : "internal pass-through")
-                   << G4endl;
-        }
-        return wantExit ? probeOutside : !probeOutside;
+        return net > 0;  // net=0 → assembly joint (In+Out cancel) → not a real boundary
     };
 
-    for (const auto& g : GroupHits(algo->intersector, octTol)) {
+    for (const auto& g : GroupHits(std::move(rawHits), octTol)) {
         if (!isBoundaryGroup(g)) continue;
 
         const G4double band = bandOf(g);  // per-solid surface band
         if (std::abs(g.dist) < band) {
-            if (calcNorm && validNorm && g.firstOutIdx >= 0) {
-                *n = GetNormalAtIntersection(g.firstOutIdx, algo);
+            if (calcNorm && validNorm && !g.outFace.IsNull()) {
+                *n = GetNormalAtIntersection(g.outFace, g.outU, g.outV);
                 *validNorm = true;
             }
             if (fVerboseLevel >= 2) {
@@ -437,8 +536,8 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
             return 0.0;
         }
         if (g.dist > band) {
-            if (calcNorm && validNorm && g.firstOutIdx >= 0) {
-                *n = GetNormalAtIntersection(g.firstOutIdx, algo);
+            if (calcNorm && validNorm && !g.outFace.IsNull()) {
+                *n = GetNormalAtIntersection(g.outFace, g.outU, g.outV);
                 *validNorm = true;
             }
             if (fVerboseLevel >= 2) {
@@ -477,8 +576,10 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
 
     AlgoCache* algo = GetAlgo();
     EInside result = kOutside;
+    const gp_Pnt pt = G4toOCCT(p);
     for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
-        algo->solidClassifiers[i]->Perform(G4toOCCT(p), algo->SolidBand((int)i));
+        if (algo->solidBoxes[i].IsOut(pt)) continue;
+        algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
         auto s = algo->solidClassifiers[i]->State();
         if (s == TopAbs_IN) { result = kInside; break; }
         if (s == TopAbs_ON) result = kSurface;
@@ -519,11 +620,8 @@ G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
         return bboxDist;
     }
 
-    BRepExtrema_DistShapeShape extrema;
-    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
-    extrema.LoadS2(fShape);
-    extrema.Perform();
-    G4double result = extrema.IsDone() ? extrema.Value() : 0.0;
+    NearestFaceResult nr = NearestFace(G4toOCCT(p));
+    G4double result = (nr.idx >= 0) ? nr.dist : 0.0;
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -540,8 +638,7 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector&
                                     G4ThreeVector* n) const {
     G4double result = RayCastToBoundary(p, v, BoundaryKind::Exit, calcNorm, validNorm, n);
     if (sRecordEnabled) {
-        // Rigorous stuck signature needs Inside(p): a real loop is
-        // Inside==kInside AND DistanceToOut≈0 (thinks it's in, can't get out).
+        // Rigorous stuck signature: Inside==kInside AND DistanceToOut≈0.
         int insideAtP = Inside(p);
         RecordQuery(QueryType::DistToOut, p, v, 0, result, insideAtP);
     }
@@ -558,11 +655,8 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
         return 0.0;
     }
 
-    BRepExtrema_DistShapeShape extrema;
-    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
-    extrema.LoadS2(fShape);
-    extrema.Perform();
-    G4double result = extrema.IsDone() ? extrema.Value() : 0.0;
+    NearestFaceResult nr = NearestFace(G4toOCCT(p));
+    G4double result = (nr.idx >= 0) ? nr.dist : 0.0;
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
@@ -575,11 +669,8 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
 // SurfaceNormal
 // ====================================================================
 G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
-    BRepExtrema_DistShapeShape extrema;
-    extrema.LoadS1(BRepBuilderAPI_MakeVertex(G4toOCCT(p)).Shape());
-    extrema.LoadS2(fShape);
-    extrema.Perform();
-    if (!extrema.IsDone() || extrema.NbSolution() == 0) {
+    NearestFaceResult nr = NearestFace(G4toOCCT(p));
+    if (nr.idx < 0) {
         if (fVerboseLevel >= 2) {
             G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
                    << " no solution -> (0,0,1)" << G4endl;
@@ -587,25 +678,16 @@ G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
         return G4ThreeVector(0, 0, 1);
     }
 
-    G4ThreeVector result;
-    TopoDS_Shape support = extrema.SupportOnShape2(1);
-    if (support.ShapeType() == TopAbs_FACE) {
-        TopoDS_Face face = TopoDS::Face(support);
-        BRepAdaptor_Surface surf(face);
-        gp_Pnt pLoc = extrema.PointOnShape2(1);
-        GeomAPI_ProjectPointOnSurf proj(pLoc, surf.Surface().Surface());
-        Standard_Real u, v;
-        proj.LowerDistanceParameters(u, v);
-        gp_Pnt pSurf; gp_Vec d1u, d1v;
-        surf.D1(u, v, pSurf, d1u, d1v);
-        gp_Vec norm = d1u.Crossed(d1v);
-        if (face.Orientation() == TopAbs_REVERSED) norm.Reverse();
-        result = OCCTtoG4(gp_Dir(norm));
-    } else {
-        gp_Pnt pLoc = extrema.PointOnShape2(1);
-        G4ThreeVector dir = p - OCCTtoG4(pLoc);
-        result = (dir.mag2() > 0) ? dir.unit() : G4ThreeVector(0, 0, 1);
-    }
+    const TopoDS_Face& face = fFaces[nr.idx].face;
+    BRepAdaptor_Surface surf(face);
+    GeomAPI_ProjectPointOnSurf proj(nr.pOnFace, surf.Surface().Surface());
+    Standard_Real u, v;
+    proj.LowerDistanceParameters(u, v);
+    gp_Pnt pSurf; gp_Vec d1u, d1v;
+    surf.D1(u, v, pSurf, d1u, d1v);
+    gp_Vec norm = d1u.Crossed(d1v);
+    if (face.Orientation() == TopAbs_REVERSED) norm.Reverse();
+    G4ThreeVector result = OCCTtoG4(gp_Dir(norm));
 
     if (fVerboseLevel >= 2) {
         G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
@@ -754,9 +836,6 @@ G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
     }
     return poly;
 }
-
-void G4StepSolid::SetTimingEnabled(G4bool) {}
-void G4StepSolid::PrintAllTimingReports() {}
 
 std::ostream& G4StepSolid::StreamInfo(std::ostream& os) const {
     os << "G4StepSolid: " << GetName()
