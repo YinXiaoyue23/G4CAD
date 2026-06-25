@@ -17,6 +17,8 @@
 
 同时支持多线程性能 scaling 测试，输出用于论文作图的机器可读结果。
 
+4. **横截面可视化**：在选定平面（XY/XZ/YZ）上采样规则网格点，调用 `Inside()` 分类，对比 native 与 STEP 几何的内部边界、曲面、孔洞结构和 assembly 接触面。
+
 ---
 
 ## 2. 架构：方案 B（模块化应用）
@@ -30,6 +32,7 @@ examples/validation_benchmark/
 │   ├── main.cc                          # 命令行解析 + 模块调度
 │   ├── GeometryRegistry.hh/cc           # native/STEP 几何工厂
 │   ├── NavigationValidator.hh/cc        # 随机点分类 + 射线距离对比
+│   ├── CrossSectionSampler.hh/cc        # 规则网格采样 + 横截面 CSV 输出
 │   ├── PhysicsRunner.hh/cc              # G4 仿真包装器
 │   ├── BenchmarkRunner.hh/cc            # 多线程 scaling 循环
 │   ├── OutputWriter.hh/cc               # CSV (+ 可选 ROOT) 写入
@@ -49,7 +52,8 @@ examples/validation_benchmark/
 │   └── gen_step_files.py                # FreeCAD 脚本，用于重新生成 STEP 文件
 └── python/
     ├── plot_validation.py
-    └── plot_scaling.py
+    ├── plot_scaling.py
+    └── plot_cross_section.py
 ```
 
 ### 2.2 可执行文件
@@ -74,6 +78,10 @@ g4cad_bench
   --enable-navigation-dump        (将有问题的点坐标写入 CSV，用于 FreeCAD 调试)
   --benchmark                     (启用 scaling 测试，自动遍历线程数 1/2/4/8/16)
   --physics-list  FTFP_BERT|QBBC  (默认 FTFP_BERT)
+  --cross-section                 (启用横截面采样；与 --navigation-test 相同，
+                                   要求同时提供 --step-file，始终对比 native 和 STEP)
+  --cross-section-plane  xy|xz|yz|all  (默认 all，即生成三个切面)
+  --cross-section-resolution <N>  (每个方向网格点数，默认 500，即 500×500 网格)
 ```
 
 ---
@@ -164,6 +172,126 @@ n_problematic = count(dev > tolerance)
 ```
 geometry,mode_pair,n_points,n_rays,mismatch_rate,
 mean_dev_mm,median_dev_mm,max_dev_mm,n_problematic_in,n_problematic_out
+```
+
+---
+
+## 4b. 横截面采样（CrossSectionSampler）
+
+### 4b.1 设计原则
+
+- 采样完全在 **C++ 端**完成，直接调用 `G4VSolid::Inside()`，不依赖 Python
+- Python 端仅负责读取 CSV 并渲染 PNG，二者职责分离
+- native 和 STEP 使用**完全相同**的网格范围和分辨率，确保结果可直接相减
+
+### 4b.2 接口
+
+```cpp
+enum class SlicePlane { XY, XZ, YZ };
+
+struct CrossSectionConfig {
+    int         resolution = 500;     // 每方向网格点数（500×500）
+    double      padding    = 0.05;    // bbox 扩展比例（5%）
+    std::vector<SlicePlane> planes = { SlicePlane::XY, SlicePlane::XZ, SlicePlane::YZ };
+};
+
+class CrossSectionSampler {
+public:
+    // 对单个 solid 采样指定切面，写入 CSV
+    // 文件名格式：<prefix>_<plane>.csv
+    static void Sample(G4VSolid*               solid,
+                       const G4ThreeVector&     bbox_min,
+                       const G4ThreeVector&     bbox_max,
+                       const CrossSectionConfig& cfg,
+                       const std::string&       output_prefix);
+};
+```
+
+### 4b.3 采样逻辑（以 XY 切面为例）
+
+```
+bbox 扩展 padding 后确定采样范围 [x0,x1] × [y0,y1]
+dx = (x1 - x0) / (resolution - 1)
+dy = (y1 - y0) / (resolution - 1)
+z_fixed = 0  (z=0 中心切面)
+
+对每个 (i, j)：
+    x = x0 + i * dx
+    y = y0 + j * dy
+    p = G4ThreeVector(x, y, z_fixed)
+    cls = solid->Inside(p)        // kInside=2, kSurface=1, kOutside=0
+    写入一行：x, y, z_fixed, cls
+```
+
+XZ 切面：固定 y=0，网格 [x0,x1] × [z0,z1]  
+YZ 切面：固定 x=0，网格 [y0,y1] × [z0,z1]
+
+`touching_boxes` 有两个 solid：对每个点依次查询两个 solid，取 union（任一为 kInside 则结果为 kInside，任一为 kSurface 则为 kSurface，否则 kOutside）。
+
+### 4b.4 输出文件
+
+每种几何、每种模式、每个切面各一个 CSV：
+
+```
+cross_section_<geometry>_<mode>_xy.csv
+cross_section_<geometry>_<mode>_xz.csv
+cross_section_<geometry>_<mode>_yz.csv
+```
+
+每个文件格式（无表头，节省空间；Python 读取时直接 `usecols`）：
+
+```
+x_mm, y_mm, z_mm, classification
+```
+
+`classification` 编码：`0`=kOutside，`1`=kSurface，`2`=kInside
+
+文件大小估算：500×500 × 4列 × ~10 字节/行 ≈ 10 MB/文件，共 5 几何 × 2 模式 × 3 切面 = 30 个 CSV（≈ 300 MB）。若存储受限，可将 resolution 降至 200（≈ 5 MB 总量）。
+
+### 4b.5 Python 渲染（plot_cross_section.py）
+
+**输入：** 同一几何的 native 和 STEP CSV 文件对
+
+**输出（每种几何 × 每个切面 = 15 张图）：**
+
+```
+cross_section_<geometry>_<plane>_comparison.png
+```
+
+每张图为 **1×3 子图布局**：
+
+```
+[native 分类图] | [STEP 分类图] | [差异图]
+```
+
+- **分类图**：二维热图，颜色映射：kInside=蓝色，kSurface=红色，kOutside=白色/浅灰
+- **差异图**：逐点对比，颜色映射：
+  - 两者一致 → 白色
+  - native=kInside, STEP=kOutside → 橙色（G4CAD 将内部误判为外部）
+  - native=kOutside, STEP=kInside → 紫色（G4CAD 将外部误判为内部）
+  - 含 kSurface 的不一致 → 黄色（边界带差异）
+
+图形规格（适合论文）：
+- DPI ≥ 300
+- 子图尺寸约 4×4 英寸，总图宽约 14 英寸
+- 坐标轴标注单位 mm，colorbar 标注分类名称
+- 标题格式：`<geometry> — <plane> slice at <axis>=0`
+
+**典型调用：**
+
+```bash
+python python/plot_cross_section.py \
+    --geometry box_hole \
+    --plane xy \
+    --native  results/cross_section_box_hole_native_xy.csv \
+    --step    results/cross_section_box_hole_step_xy.csv \
+    --output  figures/
+```
+
+或批量处理所有几何和切面：
+
+```bash
+python python/plot_cross_section.py --all --data-dir results/ --output figures/
 ```
 
 ---
@@ -310,6 +438,7 @@ set(SOURCES
     src/main.cc
     src/GeometryRegistry.cc
     src/NavigationValidator.cc
+    src/CrossSectionSampler.cc
     src/PhysicsRunner.cc
     src/BenchmarkRunner.cc
     src/OutputWriter.cc
@@ -355,6 +484,17 @@ cmake --build build -j$(nproc)
     --navigation-test --step-file step_files/box.step \
     --events 0 --output results/box
 
+# 横截面采样：box_hole，所有三个切面，500×500 分辨率
+./build/g4cad_bench --geometry box_hole --mode native \
+    --cross-section --cross-section-plane all --cross-section-resolution 500 \
+    --step-file step_files/box_hole.step \
+    --events 0 --output results/box_hole
+# 生成：results/cross_section_box_hole_native_xy.csv 等 6 个 CSV
+
+# 渲染横截面对比图
+python python/plot_cross_section.py --all \
+    --data-dir results/ --output figures/
+
 # 物理对比：10 MeV e- on cylinder，native 和 STEP
 ./build/g4cad_bench --geometry cylinder --mode native \
     --events 10000 --seed 42 --output results/cyl_native
@@ -382,6 +522,7 @@ python python/plot_scaling.py results/scaling_summary.csv
 | 点分类失配率与射线偏差表 | `navigation_test.csv` | `plot_validation.py` 表 2 |
 | 能量沉积/步长分布图 | `event_summary.csv` | `plot_validation.py` 图 3/4 |
 | runtime 与并行效率图 | `scaling_summary.csv` | `plot_scaling.py` 图 1/2/3 |
+| 横截面内部边界/曲面/孔洞/接触面对比图 | `cross_section_<geom>_<mode>_<plane>.csv` | `plot_cross_section.py` 图 5 |
 
 ---
 
