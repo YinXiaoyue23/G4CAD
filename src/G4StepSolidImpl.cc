@@ -1,5 +1,4 @@
 #include "G4StepSolid.hh"
-#include "G4SystemOfUnits.hh"
 
 // OCCT
 #include <BRep_Tool.hxx>
