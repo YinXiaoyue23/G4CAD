@@ -28,6 +28,9 @@
 #include <GProp_GProps.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Pln.hxx>
 #include <TopoDS_Face.hxx>
 
 #include <algorithm>
@@ -234,6 +237,32 @@ void G4StepSolid::BuildFaceWeights() {
         fe.u1 = surf.LastUParameter();
         fe.v0 = surf.FirstVParameter();
         fe.v1 = surf.LastVParameter();
+
+        switch (st) {
+            case GeomAbs_Plane: {
+                gp_Pln pln = surf.Plane();
+                fe.surfType = FaceEntry::SurfType::Plane;
+                fe.pos      = pln.Position();
+                break;
+            }
+            case GeomAbs_Cylinder: {
+                gp_Cylinder cyl = surf.Cylinder();
+                fe.surfType = FaceEntry::SurfType::Cylinder;
+                fe.pos      = cyl.Position();
+                fe.cylR     = cyl.Radius();
+                break;
+            }
+            case GeomAbs_Sphere: {
+                gp_Sphere sph = surf.Sphere();
+                fe.surfType = FaceEntry::SurfType::Sphere;
+                fe.pos      = sph.Position();
+                fe.sphR     = sph.Radius();
+                break;
+            }
+            default:
+                fe.surfType = FaceEntry::SurfType::Other;
+                break;
+        }
 
         fFaces.push_back(fe);
 

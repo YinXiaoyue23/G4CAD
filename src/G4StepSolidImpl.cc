@@ -207,28 +207,128 @@ G4ThreeVector G4StepSolid::GetNormalAtIntersection(const TopoDS_Face& face,
 }
 
 // ====================================================================
-// NearestFace
+// NearestFace  —  analytic fast-path for Plane/Cylinder/Sphere
 // ====================================================================
 G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const {
     NearestFaceResult result;
     if (fFaces.empty()) return result;
 
-    const TopoDS_Shape vtxShape = BRepBuilderAPI_MakeVertex(pt).Shape();
-
     AlgoCache* algo = GetAlgo();
+    const G4double eps = algo->occtTol;
+
+    // OCCT fallback vertex shape — only constructed if at least one face
+    // actually needs it (lazy, avoids MakeVertex when all faces are analytic).
+    bool vtxBuilt = false;
+    TopoDS_Shape vtxShape;
+    auto getVtx = [&]() -> const TopoDS_Shape& {
+        if (!vtxBuilt) { vtxShape = BRepBuilderAPI_MakeVertex(pt).Shape(); vtxBuilt = true; }
+        return vtxShape;
+    };
+
+    // Inline dot-product helpers (avoids gp_Vec temporaries)
+    auto dot3 = [](double ax, double ay, double az,
+                   double bx, double by, double bz) {
+        return ax*bx + ay*by + az*bz;
+    };
+
     for (int i = 0; i < (int)fFaces.size(); ++i) {
-        if (BBoxPointDist(fFaces[i].bbox, pt) >= result.dist) continue;
+        const FaceEntry& fe = fFaces[i];
+        if (BBoxPointDist(fe.bbox, pt) >= result.dist) continue;
         if (fTimingEnabled) ++algo->timing.nfFacesVisited;
-        BRepExtrema_DistShapeShape& extrema = *algo->faceExtrema[i];
-        extrema.LoadS1(vtxShape);
-        extrema.Perform();
-        if (fTimingEnabled) ++algo->timing.nfExtremaCount;
-        if (!extrema.IsDone()) continue;
-        G4double d = extrema.Value();
+
+        G4double d = kInfinity;
+        gp_Pnt   foot;
+        bool     analytic = false;
+
+        if (fe.surfType == FaceEntry::SurfType::Plane) {
+            const gp_Pnt& loc = fe.pos.Location();
+            // Direction() is the plane normal (Z axis of gp_Ax3)
+            const gp_Dir& n   = fe.pos.Direction();
+            double dpx = pt.X()-loc.X(), dpy = pt.Y()-loc.Y(), dpz = pt.Z()-loc.Z();
+            double dn   = dot3(n.X(),n.Y(),n.Z(), dpx,dpy,dpz);
+            // UV coords of foot in plane parametric space
+            const gp_Dir& xu = fe.pos.XDirection();
+            const gp_Dir& yv = fe.pos.YDirection();
+            double uf = dot3(xu.X(),xu.Y(),xu.Z(), dpx,dpy,dpz);
+            double vf = dot3(yv.X(),yv.Y(),yv.Z(), dpx,dpy,dpz);
+            if (uf >= fe.u0 - eps && uf <= fe.u1 + eps &&
+                vf >= fe.v0 - eps && vf <= fe.v1 + eps) {
+                d    = std::abs(dn);
+                foot = gp_Pnt(pt.X() - dn*n.X(),
+                              pt.Y() - dn*n.Y(),
+                              pt.Z() - dn*n.Z());
+                analytic = true;
+                if (fTimingEnabled) ++algo->timing.nfAnalyticCount;
+            }
+
+        } else if (fe.surfType == FaceEntry::SurfType::Cylinder) {
+            const gp_Pnt& loc   = fe.pos.Location();
+            const gp_Dir& axDir = fe.pos.Direction();  // cylinder axis
+            double dpx = pt.X()-loc.X(), dpy = pt.Y()-loc.Y(), dpz = pt.Z()-loc.Z();
+            // Axial (V) parameter
+            double vf = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
+            if (vf >= fe.v0 - eps && vf <= fe.v1 + eps) {
+                // Radial component (perp to axis)
+                double px = dpx - vf*axDir.X();
+                double py = dpy - vf*axDir.Y();
+                double pz = dpz - vf*axDir.Z();
+                double r  = std::sqrt(px*px + py*py + pz*pz);
+                // Angular check — skip for full cylinder (u1-u0 ≈ 2π)
+                bool angOK = (fe.u1 - fe.u0 >= 2.0*M_PI - eps);
+                if (!angOK && r > eps) {
+                    // Compute angle in cylinder's local XY frame
+                    const gp_Dir& xu = fe.pos.XDirection();
+                    const gp_Dir& yv = fe.pos.YDirection();
+                    double uf = std::atan2(dot3(yv.X(),yv.Y(),yv.Z(), px,py,pz),
+                                           dot3(xu.X(),xu.Y(),xu.Z(), px,py,pz));
+                    if (uf < fe.u0 - eps) uf += 2.0*M_PI;
+                    angOK = (uf >= fe.u0 - eps && uf <= fe.u1 + eps);
+                }
+                if (angOK && r > 1e-15) {
+                    d = std::abs(r - fe.cylR);
+                    double scale = fe.cylR / r;
+                    foot = gp_Pnt(loc.X() + vf*axDir.X() + px*scale,
+                                  loc.Y() + vf*axDir.Y() + py*scale,
+                                  loc.Z() + vf*axDir.Z() + pz*scale);
+                    analytic = true;
+                    if (fTimingEnabled) ++algo->timing.nfAnalyticCount;
+                }
+            }
+
+        } else if (fe.surfType == FaceEntry::SurfType::Sphere) {
+            const gp_Pnt& cen = fe.pos.Location();
+            double dpx = pt.X()-cen.X(), dpy = pt.Y()-cen.Y(), dpz = pt.Z()-cen.Z();
+            double r = std::sqrt(dpx*dpx + dpy*dpy + dpz*dpz);
+            // Full sphere check (u span ≥ 2π, v span ≥ π)
+            bool fullSphere = (fe.u1 - fe.u0 >= 2.0*M_PI - eps &&
+                               fe.v1 - fe.v0 >= M_PI - eps);
+            if (fullSphere && r > 1e-15) {
+                d = std::abs(r - fe.sphR);
+                double scale = fe.sphR / r;
+                foot = gp_Pnt(cen.X() + dpx*scale,
+                              cen.Y() + dpy*scale,
+                              cen.Z() + dpz*scale);
+                analytic = true;
+                if (fTimingEnabled) ++algo->timing.nfAnalyticCount;
+            }
+        }
+
+        if (!analytic) {
+            // OCCT fallback
+            BRepExtrema_DistShapeShape& extrema = *algo->faceExtrema[i];
+            extrema.LoadS1(getVtx());
+            extrema.Perform();
+            if (fTimingEnabled) ++algo->timing.nfExtremaCount;
+            if (fTimingEnabled) ++algo->timing.nfFallbackCount;
+            if (!extrema.IsDone()) continue;
+            d    = extrema.Value();
+            foot = extrema.PointOnShape2(1);
+        }
+
         if (d < result.dist) {
             result.dist    = d;
             result.idx     = i;
-            result.pOnFace = extrema.PointOnShape2(1);
+            result.pOnFace = foot;
         }
     }
     return result;

@@ -15,6 +15,7 @@
 #include <TopTools_DataMapOfShapeInteger.hxx>
 #include <Bnd_Box.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Ax3.hxx>
 #include <TopoDS_Face.hxx>
 
 class BRepExtrema_DistShapeShape;
@@ -112,6 +113,20 @@ private:
         TopoDS_Face face;
         Bnd_Box     bbox;
         G4double u0, u1, v0, v1;
+
+        // Analytic geometry (Task 2/3): surface type + parameters extracted at construction.
+        // Only the fields relevant to surfType are populated; others are default-initialised.
+        enum class SurfType : uint8_t { Other=0, Plane=1, Cylinder=2, Sphere=3 };
+        SurfType surfType  = SurfType::Other;
+
+        // Plane  (surfType==Plane): normal = pos.Direction(), U axis = pos.XDirection(),
+        //                          V axis = pos.YDirection(), origin = pos.Location()
+        // Cylinder (surfType==Cylinder): axis dir = pos.Direction(), base = pos.Location(),
+        //                          XDir for U angle = pos.XDirection(); radius = cylR
+        // Sphere (surfType==Sphere): center = pos.Location(), radius = sphR
+        gp_Ax3   pos;           // coordinate system (shared by all three types)
+        G4double cylR = 0;      // cylinder radius (Cylinder only)
+        G4double sphR = 0;      // sphere radius   (Sphere only)
     };
 
     struct NearestFaceResult {
