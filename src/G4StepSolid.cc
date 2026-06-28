@@ -67,6 +67,7 @@ std::once_flag                           G4StepSolid::sAtexitFlag;
 // Query recorder (debug-only)
 bool           G4StepSolid::sRecordEnabled   = false;
 int            G4StepSolid::sRecordOnlyEvent = -1;
+bool           G4StepSolid::sInsideForceOCCT = false;
 std::ofstream  G4StepSolid::sRecordStream;
 std::mutex     G4StepSolid::sRecordMutex;
 std::once_flag G4StepSolid::sRecordInitFlag;
@@ -148,6 +149,10 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
     // Resolve the debug query recorder once (reads G4CAD_RECORD env); zero cost when off.
     // Per-solid tolerances are computed lazily per thread in AlgoCache (keeps ABI stable).
     std::call_once(sRecordInitFlag, &G4StepSolid::InitRecorderOnce);
+
+    // CT-IN differential test gate (read once; cheap getenv per construction).
+    if (const char* fo = std::getenv("G4CAD_INSIDE_FORCE_OCCT"))
+        if (fo[0] == '1') sInsideForceOCCT = true;
 
     CalcBBox();
     BuildFaceWeights();
@@ -257,6 +262,7 @@ void G4StepSolid::BuildFaceWeights() {
                     }
                     fe.isRectPlane = (allLine && nEdges == 4);
                 }
+                fe.analyticTrimSafe = fe.isRectPlane;  // CT-IN: plane trim-safe ⇔ rectangular
                 break;
             }
             case GeomAbs_Cylinder: {
@@ -264,6 +270,22 @@ void G4StepSolid::BuildFaceWeights() {
                 fe.surfType = FaceEntry::SurfType::Cylinder;
                 fe.pos      = cyl.Position();
                 fe.cylR     = cyl.Radius();
+                // CT-IN: trim-safe iff full-periodic in u AND exactly 4 edges, all
+                // Line (seams) or Circle (caps). Cutout/partial faces (curved edges
+                // or edge count ≠ 4) over-cover the UV box → route through OCCT.
+                {
+                    bool fullU = (surf.LastUParameter() - surf.FirstUParameter()
+                                  >= 2.0*M_PI - 1e-7);
+                    int nEdges = 0;
+                    bool simpleEdges = true;
+                    for (TopExp_Explorer ew(face, TopAbs_EDGE); ew.More() && simpleEdges; ew.Next()) {
+                        BRepAdaptor_Curve c(TopoDS::Edge(ew.Current()));
+                        GeomAbs_CurveType ct = c.GetType();
+                        simpleEdges = (ct == GeomAbs_Line || ct == GeomAbs_Circle);
+                        ++nEdges;
+                    }
+                    fe.analyticTrimSafe = (fullU && simpleEdges && nEdges == 4);
+                }
                 break;
             }
             case GeomAbs_Sphere: {
@@ -271,6 +293,19 @@ void G4StepSolid::BuildFaceWeights() {
                 fe.surfType = FaceEntry::SurfType::Sphere;
                 fe.pos      = sph.Position();
                 fe.sphR     = sph.Radius();
+                {
+                    bool fullU = (surf.LastUParameter() - surf.FirstUParameter()
+                                  >= 2.0*M_PI - 1e-7);
+                    int nEdges = 0;
+                    bool simpleEdges = true;
+                    for (TopExp_Explorer ew(face, TopAbs_EDGE); ew.More() && simpleEdges; ew.Next()) {
+                        BRepAdaptor_Curve c(TopoDS::Edge(ew.Current()));
+                        GeomAbs_CurveType ct = c.GetType();
+                        simpleEdges = (ct == GeomAbs_Line || ct == GeomAbs_Circle);
+                        ++nEdges;
+                    }
+                    fe.analyticTrimSafe = (fullU && simpleEdges && nEdges == 4);
+                }
                 break;
             }
             default:
@@ -323,6 +358,37 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
     const gp_Pnt pt = G4toOCCT(p);
     for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
         if (algo->solidBoxes[i].IsOut(pt)) continue;
+
+        // CT-IN: analytic point-in-solid via ray parity for solids whose faces are
+        // ALL analytic-complete types (Plane/Cylinder/Sphere). Solids with Cone or
+        // Torus faces fall back to BRepClass3d_SolidClassifier::Perform unchanged.
+        // This replaces the per-call OCCT classifier (594k–1.5M ns/call pathology
+        // on RP.step parts 0/1/2) with a sub-µs analytic ray cast.
+        if (algo->analyticInsideOK[i] && !sInsideForceOCCT) {
+            bool ok = true;
+            EInside ai = InsideSolidAnalytic((int)i, p, algo, ok);
+            if (ok) {
+                // CT-IN debug self-check: compare analytic vs OCCT per solid.
+                static bool selfcheck = std::getenv("G4CAD_INSIDE_SELFCHECK") != nullptr;
+                if (selfcheck) {
+                    algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
+                    auto st = algo->solidClassifiers[i]->State();
+                    EInside occt = (st==TopAbs_IN) ? kInside : (st==TopAbs_ON) ? kSurface : kOutside;
+                    if (occt != ai) {
+                        G4cout << "[SELFCHECK MISMATCH] " << GetName() << " solid#" << i
+                               << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                               << " analytic=" << (int)ai << " occt=" << (int)occt << G4endl;
+                    }
+                }
+                if (fTimingEnabled) ++algo->timing.insideAnalyticCount;
+                if (ai == kInside) { result = kInside; break; }
+                if (ai == kSurface) result = kSurface;
+                continue;
+            }
+            // Ambiguous (degenerate ray after perturbations) → fall through to OCCT.
+        }
+
+        if (fTimingEnabled) ++algo->timing.insideFallbackCount;
         algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
         auto s = algo->solidClassifiers[i]->State();
         if (s == TopAbs_IN) { result = kInside; break; }
@@ -689,6 +755,8 @@ void G4StepSolid::PrintTimingReport() const {
             total.nfExtremaCount   += c->timing.nfExtremaCount;
             total.nfAnalyticCount  += c->timing.nfAnalyticCount;
             total.nfFallbackCount  += c->timing.nfFallbackCount;
+            total.insideAnalyticCount += c->timing.insideAnalyticCount;
+            total.insideFallbackCount += c->timing.insideFallbackCount;
         }
     }
     G4cout << "[G4StepSolid timing] " << GetName() << G4endl;
@@ -718,6 +786,9 @@ void G4StepSolid::PrintTimingReport() const {
     G4cout << "    nf Extrema (OCCT):         " << total.nfExtremaCount << G4endl;
     G4cout << "    nf analytic hits:          " << total.nfAnalyticCount << G4endl;
     G4cout << "    nf fallback hits:          " << total.nfFallbackCount << G4endl;
+    G4cout << "  -- Inside (CT-IN: analytic ray parity vs OCCT classifier) --" << G4endl;
+    G4cout << "    inside analytic (parity):  " << total.insideAnalyticCount << G4endl;
+    G4cout << "    inside fallback (OCCT):    " << total.insideFallbackCount << G4endl;
 }
 
 void G4StepSolid::PrintAllTimingReports() {

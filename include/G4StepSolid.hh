@@ -133,6 +133,19 @@ private:
         // is sufficient. For other plane trims (disks, annular rings, polygons) fall back
         // to OCCT so we don't produce hits outside the actual face boundary.
         bool isRectPlane = false;
+
+        // CT-IN: true iff the analytic UV-rectangle [u0,u1]×[v0,v1] is the EXACT trim
+        // boundary of the face, so analytic ray-face intersection cannot produce a hit
+        // outside the real face. This is required for ray-parity Inside(): a single
+        // spurious hit flips parity. Criteria:
+        //   Plane    → isRectPlane (4 line edges).
+        //   Cylinder → full periodic in u (uspan≈2π) AND exactly 4 edges, all Line/Circle
+        //              (the 2 seam lines + 2 cap circles → UV box == trim, no cutouts).
+        //   Sphere   → same as cylinder.
+        // Faces with cutouts, curved (BSpline) trims, or partial non-rectangular trims
+        // are NOT trim-safe → ray parity routes them through the OCCT trim-exact
+        // IntCurvesFace_Intersector instead (still ~150× faster than BRepClass3d::Perform).
+        bool analyticTrimSafe = false;
     };
 
     struct NearestFaceResult {
@@ -163,6 +176,12 @@ private:
         int64_t nfExtremaCount   = 0; // BRepExtrema_DistShapeShape::Perform calls (OCCT path)
         int64_t nfAnalyticCount  = 0; // analytic point-face distance hits (Task 2, zero until then)
         int64_t nfFallbackCount  = 0; // OCCT fallback distance hits (Task 2, zero until then)
+
+        // Inside() path sub-counters (CT-IN): per-solid analytic ray-parity vs OCCT
+        // BRepClass3d_SolidClassifier::Perform fallback. Counted per (point × solid),
+        // i.e. each solid that a point is tested against contributes one tick.
+        int64_t insideAnalyticCount = 0; // solid-tests resolved by analytic ray parity
+        int64_t insideFallbackCount = 0; // solid-tests that fell back to OCCT classifier
     };
 
     // Thread-local OCCT algorithm objects
@@ -190,6 +209,26 @@ private:
         G4double                       requestedTol = 1e-7;
         G4double                       occtTol      = 1e-7;
         bool                           perSolidTol  = true;
+
+        // --- CT-IN: analytic Inside (ray parity) per-solid data ---
+        // For each solid (index i, same order as solidClassifiers/solidBoxes):
+        //   solidFaceIdx[i] = list of indices into owner->fFaces belonging to solid i.
+        //   analyticInsideOK[i] = true iff EVERY face of solid i is an analytic-complete
+        //                         type (Plane/Cylinder/Sphere). Cone/Torus/Other → false →
+        //                         that solid falls back to BRepClass3d_SolidClassifier.
+        // Built once when the AlgoCache is constructed (owned by libG4CAD → ABI-safe).
+        std::vector<std::vector<int>>  solidFaceIdx;
+        std::vector<char>              analyticInsideOK;
+
+        // Per-solid parity ray directions, ordered fastest→slowest, chosen at
+        // construction by timing candidate directions against this solid's faces.
+        // The OCCT IntCurvesFace_Intersector used for BSpline-trimmed analytic
+        // faces is strongly direction-dependent (a bad direction can be 50–250×
+        // slower); picking good directions per solid keeps Inside in the µs range.
+        std::vector<std::vector<G4ThreeVector>> solidParityDirs;
+
+        // Scratch buffer for the Inside ray-parity hit list (reused per query, no alloc).
+        std::vector<RayHit>            scratchInsideHits;
 
         TimingStats         timing;
         const G4StepSolid*  owner = nullptr;
@@ -231,6 +270,13 @@ private:
     enum class QueryType { Inside, DistToIn, DistToOut };
     static bool           sRecordEnabled;
     static int            sRecordOnlyEvent;
+
+    // CT-IN differential test hook: when G4CAD_INSIDE_FORCE_OCCT=1, Inside() skips
+    // the analytic ray-parity path and always uses BRepClass3d_SolidClassifier.
+    // Lets the benchmark sample the same point cloud under both code paths and
+    // count analytic-vs-OCCT disagreements. Read once at construction. Static →
+    // no effect on sizeof (ABI-safe).
+    static bool           sInsideForceOCCT;
     static std::ofstream  sRecordStream;
     static std::mutex     sRecordMutex;
     static std::once_flag sRecordInitFlag;
@@ -248,6 +294,22 @@ private:
     void BuildFaceWeights();
     AlgoCache* GetAlgo() const;
     NearestFaceResult NearestFace(const gp_Pnt& pt) const;
+
+    // --- CT-IN: analytic point-in-solid via ray parity ---
+    // Append analytic ray-face hits for ONE face to `hits` along ray (p, dir).
+    // dir need not be unit length (w-parameters are along dir). Returns false if
+    // the face is not an analytic type (caller must then bail to OCCT for the solid).
+    // Mirrors the exact analytic math used by RayCastToBoundary so Inside() stays
+    // consistent with DistanceToIn/Out.
+    bool IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
+                                const G4ThreeVector& dir, G4double octTol,
+                                std::vector<RayHit>& hits) const;
+    // Classify p against a single analytic solid (index si) by ray parity.
+    // Returns kInside / kOutside / kSurface. `ok` is set false if the analytic
+    // method could not decide (ambiguous after perturbation retries) → caller
+    // falls back to the OCCT classifier for that solid.
+    EInside InsideSolidAnalytic(int si, const G4ThreeVector& p,
+                                AlgoCache* algo, bool& ok) const;
     G4ThreeVector GetNormalAtIntersection(const TopoDS_Face& face, G4double u, G4double v) const;
 
     // Unified ray-boundary helper used by both DistanceToIn(p,v) and DistanceToOut(p,v).

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
+#include <chrono>
 
 namespace {
     // Coordinate converters — redefined here to avoid a shared private header
@@ -161,6 +162,91 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
     const size_t nFaces = ownerSolid->fFaces.size();
     scratchHits.reserve(2 * nFaces);
     scratchGroups.reserve(nFaces);
+    scratchInsideHits.reserve(2 * nFaces);
+
+    // --- CT-IN: build per-solid face index lists + analytic-Inside coverage flags ---
+    // solidClassifiers has one entry per TopAbs_SOLID (built above, same `si` order).
+    // For each face in fFaces, look up its owning solid via faceSolidMap and bucket it.
+    const size_t nSolids = solidClassifiers.size();
+    solidFaceIdx.assign(nSolids, {});
+    analyticInsideOK.assign(nSolids, 1);  // start true; cleared by any non-analytic face
+    for (int fi = 0; fi < (int)ownerSolid->fFaces.size(); ++fi) {
+        const TopoDS_Face& f = ownerSolid->fFaces[fi].face;
+        int si = FaceToSolid(f);
+        if (si < 0 || si >= (int)nSolids) {
+            // Unmapped face (should not happen): be conservative — no analytic Inside.
+            for (auto& flag : analyticInsideOK) flag = 0;
+            continue;
+        }
+        solidFaceIdx[si].push_back(fi);
+        const auto st = ownerSolid->fFaces[fi].surfType;
+        if (st != G4StepSolid::FaceEntry::SurfType::Plane &&
+            st != G4StepSolid::FaceEntry::SurfType::Cylinder &&
+            st != G4StepSolid::FaceEntry::SurfType::Sphere) {
+            analyticInsideOK[si] = 0;  // Cone/Torus/Other → OCCT fallback for this solid
+        }
+    }
+    // A solid with zero registered faces (degenerate) must not use analytic Inside.
+    for (size_t i = 0; i < nSolids; ++i)
+        if (solidFaceIdx[i].empty()) analyticInsideOK[i] = 0;
+
+    // --- CT-IN: per-solid parity-direction selection ---
+    // For each analytic solid, time a fixed set of candidate ray directions against
+    // its faces (using the prebuilt OCCT intersectors that the non-trim-safe faces
+    // will actually use) and keep the 4 fastest, fastest first. This sidesteps the
+    // OCCT IntCurvesFace_Intersector direction pathology on BSpline-trimmed cylinders.
+    // The candidate set is deterministic; the probe origins are deterministic too.
+    {
+        solidParityDirs.assign(nSolids, {});
+        // 14 well-spread unit directions (axis-ish + diagonals). Deterministic.
+        static const double cand[][3] = {
+            {0.9789,0.1449,0.1449},{0.1449,0.9789,0.1449},{0.1449,0.1449,0.9789},
+            {0.8018,0.5345,0.2673},{0.2673,0.8018,0.5345},{0.5345,0.2673,0.8018},
+            {0.5774,0.5774,0.5774},{-0.5774,0.5774,0.5774},{0.5774,-0.5774,0.5774},
+            {0.5774,0.5774,-0.5774},{0.3015,-0.9045,0.3015},{-0.4264,0.6396,0.6396},
+            {0.6963,0.6963,0.1741},{0.1741,0.6963,0.6963}
+        };
+        const int NC = (int)(sizeof(cand)/sizeof(cand[0]));
+        for (size_t i = 0; i < nSolids; ++i) {
+            if (!analyticInsideOK[i]) continue;
+            // Solid bbox centroid + a few interior-ish probe origins.
+            Bnd_Box b; { for (int fi : solidFaceIdx[i]) b.Add(ownerSolid->fFaces[fi].bbox); }
+            if (b.IsVoid()) continue;
+            double x0,y0,z0,x1,y1,z1; b.Get(x0,y0,z0,x1,y1,z1);
+            gp_Pnt probes[3] = {
+                gp_Pnt(0.5*(x0+x1), 0.5*(y0+y1), 0.5*(z0+z1)),
+                gp_Pnt(0.5*(x0+x1)+0.13*(x1-x0), 0.5*(y0+y1)-0.11*(y1-y0), 0.5*(z0+z1)+0.07*(z1-z0)),
+                gp_Pnt(0.5*(x0+x1)-0.09*(x1-x0), 0.5*(y0+y1)+0.15*(y1-y0), 0.5*(z0+z1)-0.12*(z1-z0))
+            };
+            std::vector<std::pair<double,int>> cost(NC);  // (time, candIdx)
+            for (int c = 0; c < NC; ++c) {
+                double L = std::sqrt(cand[c][0]*cand[c][0]+cand[c][1]*cand[c][1]+cand[c][2]*cand[c][2]);
+                gp_Dir gd(cand[c][0]/L, cand[c][1]/L, cand[c][2]/L);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (const gp_Pnt& pr : probes) {
+                    gp_Lin ray(pr, gd);
+                    for (int fi : solidFaceIdx[i]) {
+                        // Only non-trim-safe faces incur the OCCT intersector cost.
+                        if (!ownerSolid->fFaces[fi].analyticTrimSafe)
+                            faceIntersectors[fi]->Perform(ray, -occtTol, kInfinity);
+                    }
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                cost[c] = { (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count(), c };
+            }
+            std::sort(cost.begin(), cost.end());
+            int keep = std::min(4, NC);
+            solidParityDirs[i].reserve(keep);
+            for (int k = 0; k < keep; ++k) {
+                const double* d = cand[cost[k].second];
+                double L = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+                solidParityDirs[i].emplace_back(d[0]/L, d[1]/L, d[2]/L);
+            }
+            if (std::getenv("G4CAD_PARITY_DIRSEL"))
+                G4cout << "[DIRSEL] solid#" << i << " best cand=" << cost[0].second
+                       << " t=" << cost[0].first << "ns  worst t=" << cost.back().first << "ns" << G4endl;
+        }
+    }
 
     static std::once_flag tolPrintFlag;
     if (std::getenv("G4CAD_TOL_VERBOSE"))
@@ -617,4 +703,305 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut][local]"
                << " no real boundary -> bbox=" << t << G4endl;
     return (t > 0.0 && std::isfinite(t)) ? t : 0.0;
+}
+
+// ====================================================================
+// CT-IN: analytic point-in-solid via ray parity
+// ====================================================================
+//
+// IntersectFaceForParity — append analytic ray-face hits for ONE face along the
+// ray (p, dir). `dir` MUST be unit length so all w-parameters are true distances
+// (keeps cylinder/sphere analytic roots consistent with the gp_Lin-based OCCT
+// intersector used for non-rectangular planes). Returns false only for a
+// non-analytic face type (Cone/Torus/Other) — the caller pre-screens solids so
+// this should not fire, but it guards against a mismatch between the coverage
+// flag and the per-face math.
+//
+// This mirrors the EXACT transition/UV math of RayCastToBoundary so that Inside()
+// and DistanceToIn/Out agree on whether a point is on/in/out of the boundary.
+bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
+                                         const G4ThreeVector& dir, G4double octTol,
+                                         std::vector<RayHit>& hits) const
+{
+    auto dot3 = [](double ax_, double ay_, double az_,
+                   double bx_, double by_, double bz_) {
+        return ax_*bx_ + ay_*by_ + az_*bz_;
+    };
+
+    // Non-analytic surface type → caller must not be here (solid pre-screened).
+    if (fe.surfType != FaceEntry::SurfType::Plane &&
+        fe.surfType != FaceEntry::SurfType::Cylinder &&
+        fe.surfType != FaceEntry::SurfType::Sphere)
+        return false;
+
+    // Trim-exact path: any face whose UV bounding rectangle is NOT its exact trim
+    // (non-rect plane, cylinder/sphere with cutouts or curved/partial trims) goes
+    // through the per-face OCCT IntCurvesFace_Intersector, which respects the true
+    // trimmed boundary. This is mandatory for ray parity — a single spurious hit on
+    // an over-covered UV rectangle flips the inside/outside result. Still ~150×
+    // cheaper than BRepClass3d_SolidClassifier::Perform (the pathology we replace).
+    if (!fe.analyticTrimSafe) {
+        AlgoCache* algo = GetAlgo();
+        int fi = (int)(&fe - &fFaces[0]);   // fe ∈ fFaces → recover global index
+        gp_Lin ray(G4toOCCT(p), gp_Dir(dir.x(), dir.y(), dir.z()));
+        IntCurvesFace_Intersector& inter = *algo->faceIntersectors[fi];
+        inter.Perform(ray, -octTol, kInfinity);
+        for (int j = 1; j <= inter.NbPnt(); ++j)
+            hits.emplace_back(inter.WParameter(j), inter.Transition(j),
+                              fe.face, inter.UParameter(j), inter.VParameter(j));
+        return true;
+    }
+
+    // ─── Plane (rectangular trim → UV box exact) ───────────────────────────
+    if (fe.surfType == FaceEntry::SurfType::Plane) {
+        const gp_Ax3& ax  = fe.pos;
+        const gp_Dir& nm  = ax.Direction();
+        const gp_Pnt& loc = ax.Location();
+        double nv = dot3(nm.X(),nm.Y(),nm.Z(), dir.x(),dir.y(),dir.z());
+        if (std::abs(nv) >= 1e-15) {
+            double np = dot3(nm.X(),nm.Y(),nm.Z(),
+                             p.x()-loc.X(), p.y()-loc.Y(), p.z()-loc.Z());
+            double t = -np / nv;
+            if (t >= -octTol) {
+                double hx = p.x()+t*dir.x()-loc.X();
+                double hy = p.y()+t*dir.y()-loc.Y();
+                double hz = p.z()+t*dir.z()-loc.Z();
+                const gp_Dir& xu = ax.XDirection();
+                const gp_Dir& yv = ax.YDirection();
+                double uf = dot3(xu.X(),xu.Y(),xu.Z(), hx,hy,hz);
+                double vf = dot3(yv.X(),yv.Y(),yv.Z(), hx,hy,hz);
+                if (uf >= fe.u0-octTol && uf <= fe.u1+octTol &&
+                    vf >= fe.v0-octTol && vf <= fe.v1+octTol) {
+                    bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+                    double n_out_v = fwd ? nv : -nv;
+                    IntCurveSurface_TransitionOnCurve trans;
+                    if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                    else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                    else                        trans = IntCurveSurface_Tangent;
+                    hits.emplace_back(t, trans, fe.face, uf, vf);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ─── Cylinder (full periodic, rectangular v-trim → UV box exact) ───────
+    if (fe.surfType == FaceEntry::SurfType::Cylinder) {
+        const gp_Ax3& ax    = fe.pos;
+        const gp_Dir& axDir = ax.Direction();
+        const gp_Pnt& axLoc = ax.Location();
+        const double   R    = fe.cylR;
+
+        double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
+        double da  = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
+        double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), dir.x(),dir.y(),dir.z());
+        double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
+        double vpx = dir.x()-va_*axDir.X(), vpy = dir.y()-va_*axDir.Y(), vpz = dir.z()-va_*axDir.Z();
+
+        double A = vpx*vpx + vpy*vpy + vpz*vpz;
+        if (A >= 1e-30) {
+            double B    = ppx*vpx + ppy*vpy + ppz*vpz;
+            double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
+            double disc = B*B - A*C;
+            if (disc >= 0) {
+                double sqrtD   = std::sqrt(std::max(disc, 0.0));
+                bool   tang    = (sqrtD < octTol * std::sqrt(A));
+                bool   fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
+                bool   fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+
+                auto tryRoot = [&](double t) {
+                    if (t < -octTol) return;
+                    double v_ax = da + t * va_;
+                    if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
+                    double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
+                    double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                    if (r < 1e-15) return;
+                    const gp_Dir& xu_c = ax.XDirection();
+                    const gp_Dir& yv_c = ax.YDirection();
+                    double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
+                                           dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
+                    if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
+                    if (!fullAng && (uf < fe.u0 - octTol || uf > fe.u1 + octTol)) return;
+                    IntCurveSurface_TransitionOnCurve trans;
+                    if (tang) {
+                        trans = IntCurveSurface_Tangent;
+                    } else {
+                        double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
+                        double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                        else                        trans = IntCurveSurface_Tangent;
+                    }
+                    hits.emplace_back(t, trans, fe.face, uf, v_ax);
+                };
+                if (tang) {
+                    tryRoot(-B / A);
+                } else {
+                    tryRoot((-B - sqrtD) / A);
+                    tryRoot((-B + sqrtD) / A);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ─── Sphere ───────────────────────────────────────────────────────────
+    if (fe.surfType == FaceEntry::SurfType::Sphere) {
+        const gp_Pnt& cen = fe.pos.Location();
+        const double   R  = fe.sphR;
+
+        double dpx = p.x()-cen.X(), dpy = p.y()-cen.Y(), dpz = p.z()-cen.Z();
+        double A    = dir.x()*dir.x() + dir.y()*dir.y() + dir.z()*dir.z();  // ≈ 1 (unit dir)
+        double B    = dpx*dir.x() + dpy*dir.y() + dpz*dir.z();
+        double C    = dpx*dpx + dpy*dpy + dpz*dpz - R*R;
+        double disc = B*B - A*C;
+        if (disc >= 0) {
+            double sqrtD   = std::sqrt(std::max(disc, 0.0));
+            bool   tang    = (sqrtD < octTol * std::sqrt(A));
+            bool   fullSph = (fe.u1-fe.u0 >= 2.0*M_PI-octTol &&
+                              fe.v1-fe.v0 >= M_PI-octTol);
+            bool   fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+
+            auto tryRoot = [&](double t) {
+                if (t < -octTol) return;
+                double qx = dpx+t*dir.x(), qy = dpy+t*dir.y(), qz = dpz+t*dir.z();
+                double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                if (r < 1e-15) return;
+                double uf = 0.0, vf = 0.0;
+                if (!fullSph) {
+                    const gp_Dir& xu   = fe.pos.XDirection();
+                    const gp_Dir& yv_  = fe.pos.YDirection();
+                    const gp_Dir& zv_  = fe.pos.Direction();
+                    double xl = dot3(xu.X(),xu.Y(),xu.Z(), qx,qy,qz);
+                    double yl = dot3(yv_.X(),yv_.Y(),yv_.Z(), qx,qy,qz);
+                    double zl = dot3(zv_.X(),zv_.Y(),zv_.Z(), qx,qy,qz);
+                    uf = std::atan2(yl, xl);
+                    vf = std::asin(std::max(-1.0, std::min(1.0, zl/r)));
+                    if (uf < fe.u0 - octTol) uf += 2.0*M_PI;
+                    if (uf < fe.u0 - octTol || uf > fe.u1 + octTol) return;
+                    if (vf < fe.v0 - octTol || vf > fe.v1 + octTol) return;
+                }
+                IntCurveSurface_TransitionOnCurve trans;
+                if (tang) {
+                    trans = IntCurveSurface_Tangent;
+                } else {
+                    double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
+                    double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                    if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                    else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                    else                        trans = IntCurveSurface_Tangent;
+                }
+                hits.emplace_back(t, trans, fe.face, uf, vf);
+            };
+            if (tang) {
+                tryRoot(-B / A);
+            } else {
+                tryRoot((-B - sqrtD) / A);
+                tryRoot((-B + sqrtD) / A);
+            }
+        }
+        return true;
+    }
+
+    return false;  // non-analytic face type
+}
+
+// InsideSolidAnalytic — classify p against analytic solid `si` by ray parity.
+// Casts a deterministic ray, builds hit groups via GroupHits, and counts genuine
+// transversal crossings in front of p (w > 0). Odd ⇒ inside; even ⇒ outside.
+// If the nearest crossing group is within the solid band ⇒ kSurface. Degenerate
+// rays (grazing edges/vertices producing only Tangent groups near the parity
+// boundary, or an odd number of net-zero-cancelling groups) are retried with a
+// deterministically perturbed direction; `ok=false` if still ambiguous.
+EInside G4StepSolid::InsideSolidAnalytic(int si, const G4ThreeVector& p,
+                                         AlgoCache* algo, bool& ok) const
+{
+    ok = true;
+    const std::vector<int>& faceIdx = algo->solidFaceIdx[si];
+    const G4double band = algo->SolidBand(si);
+    // octTol is the global OCCT search/grouping window — reuse for hit grouping
+    // so coincident hits at shared edges merge exactly as in the ray path.
+    const G4double octTol = algo->occtTol;
+
+    // Deterministic ray directions: a primary axis-tilted dir, then perturbations.
+    // Tilted away from axes to avoid systematically grazing axis-aligned planes.
+    static const G4ThreeVector kDirs[4] = {
+        G4ThreeVector(0.5773502691896258, 0.5773502691896258, 0.5773502691896258),
+        G4ThreeVector(0.7745966692414834, 0.5163977794943222, 0.3651483716701107),
+        G4ThreeVector(-0.4264014327112209, 0.6396021490668313, 0.6396021490668313),
+        G4ThreeVector(0.3015113445777636, -0.9045340337332909, 0.3015113445777636)
+    };
+
+    std::vector<RayHit>& hits = algo->scratchInsideHits;
+
+    // Per-solid parity directions chosen at construction to avoid the OCCT
+    // intersector's direction-dependent pathology on BSpline-trimmed cylinders
+    // (a fixed diagonal can be 50–250× slower than a good direction). Fall back
+    // to the global kDirs if none were selected for this solid.
+    const std::vector<G4ThreeVector>* solidDirs =
+        (si < (int)algo->solidParityDirs.size() && !algo->solidParityDirs[si].empty())
+        ? &algo->solidParityDirs[si] : nullptr;
+    // Cap attempts: on these BSpline-trimmed solids each ray is expensive, so retry
+    // only a couple of perturbations before deferring to the OCCT classifier — fewer
+    // repeated slow rays trims the heavy tail without changing the result (the
+    // classifier is the authoritative fallback anyway).
+    const int maxAvail  = solidDirs ? (int)solidDirs->size() : 4;
+    const int nAttempts = std::min(2, maxAvail);
+
+    for (int attempt = 0; attempt < nAttempts; ++attempt) {
+        const G4ThreeVector& dir = solidDirs ? (*solidDirs)[attempt] : kDirs[attempt];
+        hits.clear();
+        bool allAnalytic = true;
+        for (int fi : faceIdx) {
+            if (!IntersectFaceForParity(fFaces[fi], p, dir, octTol, hits)) {
+                allAnalytic = false;
+                break;
+            }
+        }
+        if (!allAnalytic) { ok = false; return kOutside; }
+
+        GroupHits(hits, algo->scratchGroups, octTol);
+
+        // Classify groups. A "crossing" is a group with a net transition
+        // (nIn != nOut); these are the genuine boundary penetrations. Tangent-only
+        // groups (nIn==nOut==0) were already dropped by GroupHits. A group that
+        // carries hits but nets to zero (nIn==nOut>0) is a grazing coincidence
+        // (e.g. ray tangent to a shared edge) → flag ambiguous and retry.
+        //
+        // Closed-manifold invariant: a non-degenerate ray crosses a closed solid
+        // boundary an EVEN number of times total (every entry has a matching exit).
+        // If totalCross is ODD, the ray grazed/clipped a boundary and the parity is
+        // unreliable → perturb and retry; after all retries → OCCT classifier
+        // fallback. This is the guard against the spurious-hit "explosion" family.
+        int  parity      = 0;   // forward (dist > band) crossings → inside test
+        int  totalCross  = 0;   // all crossings (any dist) → even-parity invariant
+        bool nearSurface = false;
+        bool ambiguous   = false;
+        for (const auto& g : algo->scratchGroups) {
+            bool crossing = (g.nIn != g.nOut);
+            bool graze    = (!crossing && (g.nIn + g.nOut) > 0);
+            if (std::abs(g.dist) <= band) {
+                // Group essentially AT the point → on the surface.
+                if (crossing || graze) nearSurface = true;
+                continue;
+            }
+            if (crossing) {
+                ++totalCross;
+                if (g.dist > band) ++parity;
+            } else if (graze) {
+                ambiguous = true;
+            }
+        }
+
+        if (nearSurface) return kSurface;
+        // Odd total crossings ⇒ grazing/clipping artifact ⇒ unreliable parity.
+        if (totalCross & 1) ambiguous = true;
+        if (ambiguous) {
+            if (attempt < nAttempts - 1) continue;  // perturb ray and recount
+            ok = false; return kOutside;            // give up → caller uses OCCT classifier
+        }
+        return (parity & 1) ? kInside : kOutside;
+    }
+    ok = false;
+    return kOutside;
 }
