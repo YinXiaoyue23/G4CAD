@@ -27,66 +27,6 @@ namespace {
     inline gp_Pnt        G4toOCCT(const G4ThreeVector& v) { return gp_Pnt(v.x(), v.y(), v.z()); }
     inline G4ThreeVector OCCTtoG4(const gp_Dir& d)        { return G4ThreeVector(d.X(), d.Y(), d.Z()); }
 
-    // Ray-casting primitives
-    struct RayHit {
-        G4double                          w;
-        IntCurveSurface_TransitionOnCurve trans;
-        TopoDS_Face                       face;
-        G4double                          u, v;
-        RayHit(G4double w_, IntCurveSurface_TransitionOnCurve t,
-               const TopoDS_Face& f, G4double u_, G4double v_)
-            : w(w_), trans(t), face(f), u(u_), v(v_) {}
-    };
-
-    struct HitGroup {
-        G4double    dist;
-        int         nIn     = 0;
-        int         nOut    = 0;
-        TopoDS_Face outFace;
-        G4double    outU    = 0;
-        G4double    outV    = 0;
-        TopoDS_Face anyFace;
-    };
-
-    // Takes hits by value so we can sort in place.
-    std::vector<HitGroup> GroupHits(std::vector<RayHit> hits, G4double tol) {
-        if (hits.empty()) return {};
-        std::sort(hits.begin(), hits.end(),
-                  [](const RayHit& a, const RayHit& b){ return a.w < b.w; });
-
-        std::vector<HitGroup> groups;
-        for (const RayHit& h : hits) {
-            if (h.trans == IntCurveSurface_Tangent) continue;
-            if (!groups.empty() && h.w - groups.back().dist < tol) {
-                if (h.trans == IntCurveSurface_In) {
-                    groups.back().nIn++;
-                } else {
-                    groups.back().nOut++;
-                    if (groups.back().outFace.IsNull()) {
-                        groups.back().outFace = h.face;
-                        groups.back().outU    = h.u;
-                        groups.back().outV    = h.v;
-                    }
-                }
-                if (groups.back().anyFace.IsNull()) groups.back().anyFace = h.face;
-            } else {
-                HitGroup g;
-                g.dist    = h.w;
-                g.anyFace = h.face;
-                if (h.trans == IntCurveSurface_In) {
-                    g.nIn = 1;
-                } else {
-                    g.nOut    = 1;
-                    g.outFace = h.face;
-                    g.outU    = h.u;
-                    g.outV    = h.v;
-                }
-                groups.push_back(g);
-            }
-        }
-        return groups;
-    }
-
     // Minimum possible distance from point to AABB; 0 if inside.
     inline G4double BBoxPointDist(const Bnd_Box& box, const gp_Pnt& p) {
         double xmin, ymin, zmin, xmax, ymax, zmax;
@@ -136,6 +76,46 @@ namespace {
 } // namespace
 
 // ====================================================================
+// GroupHits — in-place sort + group (modifies hits vector)
+// ====================================================================
+void G4StepSolid::GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& out, G4double tol) {
+    out.clear();
+    if (hits.empty()) return;
+    std::sort(hits.begin(), hits.end(),
+              [](const RayHit& a, const RayHit& b){ return a.w < b.w; });
+
+    for (const RayHit& h : hits) {
+        if (h.trans == IntCurveSurface_Tangent) continue;
+        if (!out.empty() && h.w - out.back().dist < tol) {
+            if (h.trans == IntCurveSurface_In) {
+                out.back().nIn++;
+            } else {
+                out.back().nOut++;
+                if (out.back().outFace.IsNull()) {
+                    out.back().outFace = h.face;
+                    out.back().outU    = h.u;
+                    out.back().outV    = h.v;
+                }
+            }
+            if (out.back().anyFace.IsNull()) out.back().anyFace = h.face;
+        } else {
+            HitGroup g;
+            g.dist    = h.w;
+            g.anyFace = h.face;
+            if (h.trans == IntCurveSurface_In) {
+                g.nIn = 1;
+            } else {
+                g.nOut    = 1;
+                g.outFace = h.face;
+                g.outU    = h.u;
+                g.outV    = h.v;
+            }
+            out.push_back(g);
+        }
+    }
+}
+
+// ====================================================================
 // AlgoCache
 // ====================================================================
 int G4StepSolid::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
@@ -177,6 +157,10 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
         dss->LoadS2(fe.face);
         faceExtrema.push_back(dss);
     }
+
+    const size_t nFaces = ownerSolid->fFaces.size();
+    scratchHits.reserve(2 * nFaces);
+    scratchGroups.reserve(nFaces);
 
     static std::once_flag tolPrintFlag;
     if (std::getenv("G4CAD_TOL_VERBOSE"))
@@ -267,7 +251,8 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
     const gp_Vec invDir(1.0/v.x(), 1.0/v.y(), 1.0/v.z());
 
-    std::vector<RayHit> rawHits;
+    std::vector<RayHit>& rawHits = algo->scratchHits;
+    rawHits.clear();
     for (int fi = 0; fi < (int)fFaces.size(); ++fi) {
         const FaceEntry& fe = fFaces[fi];
         if (!rayHitsBox(ray.Location(), invDir, fe.bbox, octTol)) continue;
@@ -309,7 +294,8 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         return net > 0;
     };
 
-    for (const auto& g : GroupHits(std::move(rawHits), octTol)) {
+    GroupHits(rawHits, algo->scratchGroups, octTol);
+    for (const auto& g : algo->scratchGroups) {
         if (!isBoundaryGroup(g)) continue;
 
         const G4double band = bandOf(g);

@@ -11,6 +11,7 @@
 #include <TopoDS_Face.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <IntCurvesFace_Intersector.hxx>
+#include <IntCurveSurface_TransitionOnCurve.hxx>
 #include <TopTools_DataMapOfShapeInteger.hxx>
 #include <Bnd_Box.hxx>
 #include <gp_Pnt.hxx>
@@ -81,6 +82,31 @@ private:
     G4double fXmin, fXmax, fYmin, fYmax, fZmin, fZmax;
     G4double fTolerance;
 
+    // Ray-cast hit: one surface crossing produced by a single Perform() call or analytic formula.
+    struct RayHit {
+        G4double                          w;
+        IntCurveSurface_TransitionOnCurve trans;
+        TopoDS_Face                       face;
+        G4double                          u, v;
+        RayHit(G4double w_, IntCurveSurface_TransitionOnCurve t,
+               const TopoDS_Face& f, G4double u_, G4double v_)
+            : w(w_), trans(t), face(f), u(u_), v(v_) {}
+    };
+
+    // Grouped hits within distance tolerance: one potential boundary crossing.
+    struct HitGroup {
+        G4double    dist;
+        int         nIn     = 0;
+        int         nOut    = 0;
+        TopoDS_Face outFace;
+        G4double    outU    = 0;
+        G4double    outV    = 0;
+        TopoDS_Face anyFace;
+    };
+
+    // In-place group: sorts hits and populates out. Modifies hits in place (sorts).
+    static void GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& out, G4double tol);
+
     // For GetPointOnSurface: precomputed at construction, read-only at runtime, lock-free
     struct FaceEntry {
         TopoDS_Face face;
@@ -146,6 +172,12 @@ private:
 
         TimingStats         timing;
         const G4StepSolid*  owner = nullptr;
+
+        // Per-thread scratch buffers reused each RayCastToBoundary call to
+        // avoid per-query heap allocation. Capacity grows to steady-state
+        // (2 × nFaces) after the first few calls and never shrinks.
+        std::vector<RayHit>   scratchHits;
+        std::vector<HitGroup> scratchGroups;
 
         AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                   const G4StepSolid* ownerSolid);
