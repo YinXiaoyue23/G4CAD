@@ -83,6 +83,7 @@ static void PrintUsage(const char* prog) {
 "\n"
 "Complex STEP case:\n"
 "  --complex-case <path>   Load and run arbitrary STEP file (no native comparison)\n"
+"  --skip-volume           Skip GetCubicVolume() in complex-case (avoids MC hang for 100+ face solids)\n"
 "\n"
 "Output:\n"
 "  --output    <prefix>    Output file prefix (default \"output\")\n"
@@ -130,6 +131,7 @@ int main(int argc, char** argv) {
     bool   do_geantino_test    = false;
     std::string complex_case_file;
     bool   enable_root         = false;
+    bool   skip_volume         = false;
 
     // ---- option parsing ----
     static option long_opts[] = {
@@ -159,6 +161,7 @@ int main(int argc, char** argv) {
         {"safety-path-points",       required_argument, nullptr, 2003},
         {"geantino-test",            no_argument,       nullptr, 2004},
         {"complex-case",             required_argument, nullptr, 2006},
+        {"skip-volume",              no_argument,       nullptr, 2008},
         {"enable-root",              no_argument,       nullptr, 'r'},
         {"help",                     no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -193,6 +196,7 @@ int main(int argc, char** argv) {
             case 2003: safety_path_points = std::atoi(optarg); break;
             case 2004: do_geantino_test = true; break;
             case 2006: complex_case_file = optarg; break;
+            case 2008: skip_volume  = true;   break;
             case 'r': enable_root   = true;   break;
             case 'h': PrintUsage(argv[0]); return 0;
             default:  PrintUsage(argv[0]); return 1;
@@ -225,7 +229,8 @@ int main(int argc, char** argv) {
             double mem_after  = ReadMemRSS_MB();
             double load_time  = std::chrono::duration<double>(t_load1 - t_load0).count();
 
-            // Compute aggregate bbox and volume
+            // Compute aggregate bbox and (optionally) volume
+            // --skip-volume: skip GetCubicVolume() which uses slow MC for complex solids
             double xmin=1e30, xmax=-1e30, ymin=1e30, ymax=-1e30, zmin=1e30, zmax=-1e30;
             double total_vol = 0.0;
             for (auto* s : solids) {
@@ -234,12 +239,18 @@ int main(int argc, char** argv) {
                 xmin=std::min(xmin,pmin.x()); xmax=std::max(xmax,pmax.x());
                 ymin=std::min(ymin,pmin.y()); ymax=std::max(ymax,pmax.y());
                 zmin=std::min(zmin,pmin.z()); zmax=std::max(zmax,pmax.z());
-                total_vol += s->GetCubicVolume();
+                if (!skip_volume) total_vol += s->GetCubicVolume();
             }
-            std::cout << "[ComplexCase] n_solids=" << solids.size()
-                      << "  load_time=" << load_time << "s"
-                      << "  volume=" << total_vol << " mm3"
-                      << "  mem_delta=" << (mem_after - mem_before) << " MB\n";
+            if (skip_volume)
+                std::cout << "[ComplexCase] n_solids=" << solids.size()
+                          << "  load_time=" << load_time << "s"
+                          << "  volume=SKIPPED(--skip-volume)"
+                          << "  mem_delta=" << (mem_after - mem_before) << " MB\n";
+            else
+                std::cout << "[ComplexCase] n_solids=" << solids.size()
+                          << "  load_time=" << load_time << "s"
+                          << "  volume=" << total_vol << " mm3"
+                          << "  mem_delta=" << (mem_after - mem_before) << " MB\n";
 
             OutputWriter cwriter(output_prefix, enable_root);
 
