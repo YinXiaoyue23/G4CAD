@@ -230,6 +230,12 @@ private:
         // Scratch buffer for the Inside ray-parity hit list (reused per query, no alloc).
         std::vector<RayHit>            scratchInsideHits;
 
+        // CT1: scratch buffer for NearestFace face-ordering pass.
+        // Holds (bbox_lower_bound_dist, face_index) pairs sorted ascending so the
+        // nearest-bbox face is processed first and the loop can break early once
+        // the bbox lower bound exceeds the current best distance.
+        std::vector<std::pair<double,int>> scratchFaceOrder;
+
         TimingStats         timing;
         const G4StepSolid*  owner = nullptr;
 

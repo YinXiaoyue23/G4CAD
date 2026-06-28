@@ -163,6 +163,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
     scratchHits.reserve(2 * nFaces);
     scratchGroups.reserve(nFaces);
     scratchInsideHits.reserve(2 * nFaces);
+    scratchFaceOrder.reserve(nFaces);  // CT1: one entry per face
 
     // --- CT-IN: build per-solid face index lists + analytic-Inside coverage flags ---
     // solidClassifiers has one entry per TopAbs_SOLID (built above, same `si` order).
@@ -317,11 +318,22 @@ G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const 
         return ax*bx + ay*by + az*bz;
     };
 
-    for (int i = 0; i < (int)fFaces.size(); ++i) {
-        const FaceEntry& fe = fFaces[i];
-        if (BBoxPointDist(fe.bbox, pt) >= result.dist) continue;
+    // CT1: sort face indices by bbox lower-bound distance (ascending) so the
+    // nearest-bbox faces are processed first, making the existing prune effective.
+    // Once the bbox lower bound >= current best, all remaining faces are farther → break.
+    // Use the AlgoCache scratch buffer to avoid per-query heap allocation.
+    auto& faceOrder = algo->scratchFaceOrder;
+    faceOrder.clear();
+    const int nf = (int)fFaces.size();
+    for (int i = 0; i < nf; ++i)
+        faceOrder.emplace_back(BBoxPointDist(fFaces[i].bbox, pt), i);
+    std::sort(faceOrder.begin(), faceOrder.end());  // ascending by bbox dist
+
+    for (const auto& [bboxDist, i] : faceOrder) {
+        if (bboxDist >= result.dist) break;          // sorted → all remaining are farther
         if (fTimingEnabled) ++algo->timing.nfFacesVisited;
 
+        const FaceEntry& fe = fFaces[i];
         G4double d = kInfinity;
         gp_Pnt   foot;
         bool     analytic = false;
