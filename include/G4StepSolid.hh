@@ -127,6 +127,12 @@ private:
         gp_Ax3   pos;           // coordinate system (shared by all three types)
         G4double cylR = 0;      // cylinder radius (Cylinder only)
         G4double sphR = 0;      // sphere radius   (Sphere only)
+
+        // Plane only: true if the face is trimmed by exactly 4 line edges (a rectangle).
+        // For rectangles the UV bounding box is the exact trim boundary → analytic UV check
+        // is sufficient. For other plane trims (disks, annular rings, polygons) fall back
+        // to OCCT so we don't produce hits outside the actual face boundary.
+        bool isRectPlane = false;
     };
 
     struct NearestFaceResult {

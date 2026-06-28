@@ -31,6 +31,8 @@
 #include <gp_Cylinder.hxx>
 #include <gp_Sphere.hxx>
 #include <gp_Pln.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <GeomAbs_CurveType.hxx>
 #include <TopoDS_Face.hxx>
 
 #include <algorithm>
@@ -243,6 +245,18 @@ void G4StepSolid::BuildFaceWeights() {
                 gp_Pln pln = surf.Plane();
                 fe.surfType = FaceEntry::SurfType::Plane;
                 fe.pos      = pln.Position();
+                // Detect rectangular face: exactly 4 edges, all linear.
+                // Only rectangular faces have UV bounding box == actual trim boundary.
+                {
+                    int nEdges = 0;
+                    bool allLine = true;
+                    for (TopExp_Explorer ew(face, TopAbs_EDGE); ew.More() && allLine; ew.Next()) {
+                        BRepAdaptor_Curve c(TopoDS::Edge(ew.Current()));
+                        allLine = (c.GetType() == GeomAbs_Line);
+                        ++nEdges;
+                    }
+                    fe.isRectPlane = (allLine && nEdges == 4);
+                }
                 break;
             }
             case GeomAbs_Cylinder: {
