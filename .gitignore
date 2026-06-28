@@ -11,3 +11,13 @@ tools/
 *.user
 *.swp
 *.swo
+
+# Superpowers scratch (SDD ledger, plan cache)
+.superpowers/
+
+# Benchmark test outputs and generated figures
+examples/validation_benchmark/output/
+examples/validation_benchmark/figures/
+
+# Ephemeral progress tracking
+docs/progress/

@@ -79,6 +79,45 @@ void CrossSectionSampler::RunAll(
     }
 }
 
+void CrossSectionSampler::RunCompare(
+    const std::vector<G4VSolid*>& native_solids,
+    const std::vector<G4VSolid*>& step_solids,
+    const G4ThreeVector& bbox_min,
+    const G4ThreeVector& bbox_max,
+    const CrossSectionConfig& cfg,
+    const std::string& geometry_name,
+    OutputWriter& writer)
+{
+    for (SlicePlane plane : cfg.planes) {
+        std::string pname = PlaneToString(plane);
+        std::cout << "[CrossSectionSampler] Comparing " << geometry_name
+                  << " plane=" << pname
+                  << " res=" << cfg.resolution << "x" << cfg.resolution << " ...\n";
+
+        auto native_pts = Sample(native_solids, bbox_min, bbox_max, plane, cfg.resolution, cfg.padding);
+        auto step_pts   = Sample(step_solids,   bbox_min, bbox_max, plane, cfg.resolution, cfg.padding);
+
+        // Build mismatch map
+        std::vector<CrossSectionPoint> mismatch_pts(native_pts.size());
+        int n_mismatch = 0;
+        for (std::size_t i = 0; i < native_pts.size(); ++i) {
+            mismatch_pts[i].x = native_pts[i].x;
+            mismatch_pts[i].y = native_pts[i].y;
+            mismatch_pts[i].z = native_pts[i].z;
+            mismatch_pts[i].classification = (native_pts[i].classification != step_pts[i].classification) ? 1 : 0;
+            if (mismatch_pts[i].classification) ++n_mismatch;
+        }
+
+        writer.WriteCrossSection(geometry_name, "native",   pname, native_pts);
+        writer.WriteCrossSection(geometry_name, "step",     pname, step_pts);
+        writer.WriteCrossSection(geometry_name, "mismatch", pname, mismatch_pts);
+
+        double mismatch_rate = (double)n_mismatch / (double)native_pts.size();
+        std::cout << "[CrossSectionSampler]   mismatch_rate=" << mismatch_rate * 100.0
+                  << "% (" << n_mismatch << "/" << native_pts.size() << ")\n";
+    }
+}
+
 std::string CrossSectionSampler::PlaneToString(SlicePlane p) {
     switch (p) {
         case SlicePlane::XY: return "xy";

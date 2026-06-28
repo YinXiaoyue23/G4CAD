@@ -7,6 +7,7 @@
 struct PhysicsConfig {
     std::string geometry_name;
     std::string mode;           // "native" or "step"
+    std::string step_file;      // required when mode=="step"
     std::string particle    = "e-";
     double      energy_MeV  = 10.0;
     int         n_events    = 1000;

@@ -8,7 +8,9 @@ struct PrimaryConfig {
     std::string   particle  = "e-";
     double        energyMeV = 10.0;
     G4ThreeVector direction = G4ThreeVector(0, 0, 1);
-    G4ThreeVector position  = G4ThreeVector(0, 0, -200);
+    // Offset from Z axis so the particle avoids sphere poles (degenerate OCCT
+    // BREP points) and the box_hole centre hole (radius 20 mm).
+    G4ThreeVector position  = G4ThreeVector(30, 0, -200);
 };
 
 class ActionInitialization : public G4VUserActionInitialization {

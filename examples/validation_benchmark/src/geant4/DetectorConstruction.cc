@@ -25,11 +25,10 @@ G4VPhysicalVolume* DetectorConstruction::Construct() {
         new G4PVPlacement(nullptr, G4ThreeVector(0,0,0), lv,
                           fSolids[0]->GetName(), worldLV, false, 0);
     } else {
-        // touching_boxes: place at (±50, 0, 0) mm
+        // touching_boxes: offset is baked into G4DisplacedSolid; place at origin
         for (std::size_t i = 0; i < fSolids.size(); ++i) {
             auto* lv = new G4LogicalVolume(fSolids[i], detMat, fSolids[i]->GetName());
-            double xoff = (i == 0) ? -50.0*mm : 50.0*mm;
-            new G4PVPlacement(nullptr, G4ThreeVector(xoff, 0, 0), lv,
+            new G4PVPlacement(nullptr, G4ThreeVector(0, 0, 0), lv,
                               fSolids[i]->GetName(), worldLV, false, (int)i);
         }
     }

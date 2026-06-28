@@ -10,12 +10,22 @@ find_package(G4CAD CONFIG REQUIRED
           /home/yinxy/work/IR3/library/G4CAD/install/lib/cmake/G4CAD)
 
 message(STATUS "Geant4 version: ${Geant4_VERSION}")
+message(STATUS "G4CAD version:  ${G4CAD_VERSION}")
 message(STATUS "G4CAD found at: ${G4CAD_DIR}")
 
 option(ENABLE_ROOT "Enable ROOT output (TTree + TH1)" OFF)
 if(ENABLE_ROOT)
     find_package(ROOT REQUIRED COMPONENTS Core Hist Tree)
     message(STATUS "ROOT version: ${ROOT_VERSION}")
+endif()
+
+# Detect OpenCASCADE version for EnvironmentRecord
+find_package(OpenCASCADE CONFIG QUIET)
+if(OpenCASCADE_FOUND AND OpenCASCADE_VERSION)
+    set(_OCCT_VER "${OpenCASCADE_VERSION}")
+    message(STATUS "OpenCASCADE version: ${_OCCT_VER}")
+else()
+    set(_OCCT_VER "unknown")
 endif()
 
 set(SOURCES
@@ -26,6 +36,8 @@ set(SOURCES
     src/PhysicsRunner.cc
     src/BenchmarkRunner.cc
     src/OutputWriter.cc
+    src/SafetyDiagnostic.cc
+    src/EnvironmentRecord.cc
     src/geant4/DetectorConstruction.cc
     src/geant4/ActionInitialization.cc
     src/geant4/RunAction.cc
@@ -40,6 +52,13 @@ target_include_directories(g4cad_bench PRIVATE src)
 target_link_libraries(g4cad_bench PRIVATE
     G4CAD::G4CAD
     ${Geant4_LIBRARIES}
+)
+
+# Version defines for EnvironmentRecord
+target_compile_definitions(g4cad_bench PRIVATE
+    G4CAD_VERSION_STR="${G4CAD_VERSION}"
+    OCCT_VERSION_STR="${_OCCT_VER}"
+    BUILD_TYPE_STR="$<CONFIG>"
 )
 
 if(ENABLE_ROOT)

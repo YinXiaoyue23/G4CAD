@@ -5,6 +5,7 @@
 #include "G4Sphere.hh"
 #include "G4Tubs.hh"
 #include "G4SubtractionSolid.hh"
+#include "G4DisplacedSolid.hh"
 #include "G4SystemOfUnits.hh"
 #include "G4PhysicalConstants.hh"
 #include <stdexcept>
@@ -29,11 +30,20 @@ std::vector<G4VSolid*> GeometryRegistry::CreateNative(GeometryType type) {
             return { new G4SubtractionSolid("box_hole", box, hole) };
         }
 
-        case GeometryType::TouchingBoxes:
+        case GeometryType::TouchingBoxes: {
+            // Boxes are placed at ±50mm in DetectorConstruction.
+            // Bake the offsets into G4DisplacedSolid so that Inside() uses
+            // world-frame coordinates, matching the STEP solids which encode
+            // absolute position from FreeCAD.
+            auto* raw_L = new G4Box("box_L_raw", 50*mm, 100*mm, 100*mm);
+            auto* raw_R = new G4Box("box_R_raw", 50*mm, 100*mm, 100*mm);
             return {
-                new G4Box("box_L", 50*mm, 100*mm, 100*mm),
-                new G4Box("box_R", 50*mm, 100*mm, 100*mm)
+                new G4DisplacedSolid("box_L", raw_L,
+                    G4Transform3D(HepGeom::Translate3D(-50*mm, 0, 0))),
+                new G4DisplacedSolid("box_R", raw_R,
+                    G4Transform3D(HepGeom::Translate3D(+50*mm, 0, 0)))
             };
+        }
     }
     throw std::runtime_error("GeometryRegistry::CreateNative: unknown type");
 }

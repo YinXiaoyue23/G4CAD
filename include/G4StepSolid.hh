@@ -16,6 +16,8 @@
 #include <gp_Pnt.hxx>
 #include <TopoDS_Face.hxx>
 
+class BRepExtrema_DistShapeShape;
+
 #include <vector>
 #include <mutex>
 #include <memory>
@@ -92,6 +94,9 @@ private:
         std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> solidClassifiers;
         std::vector<Bnd_Box>                                       solidBoxes;
         std::vector<IntCurvesFace_Intersector*>                    faceIntersectors;
+        // Pre-built BRepExtrema objects (one per face, S2=face fixed).
+        // LoadS1(vtx)+Perform() per query avoids re-decomposing the face each time.
+        std::vector<BRepExtrema_DistShapeShape*>                   faceExtrema;
 
         // --- Per-solid tolerance ---
         // Each solid carries geometric noise σ_i (max BRep tol over its faces/edges/vertices).

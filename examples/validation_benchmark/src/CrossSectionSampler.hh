@@ -35,6 +35,17 @@ public:
         const std::string& mode,
         OutputWriter& writer);
 
+    // Compare native vs step: write native, step, and mismatch CSV for each plane.
+    // mismatch classification: 0 = agree, 1 = disagree.
+    static void RunCompare(
+        const std::vector<G4VSolid*>& native_solids,
+        const std::vector<G4VSolid*>& step_solids,
+        const G4ThreeVector& bbox_min,
+        const G4ThreeVector& bbox_max,
+        const CrossSectionConfig& cfg,
+        const std::string& geometry_name,
+        OutputWriter& writer);
+
     static std::string PlaneToString(SlicePlane p);
     static SlicePlane  ParsePlane(const std::string& s);
 
