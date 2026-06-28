@@ -146,6 +146,9 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
 
     CalcBBox();
     BuildFaceWeights();
+
+    // Enable per-call timing when G4CAD_TIMER is set; zero overhead otherwise.
+    if (std::getenv("G4CAD_TIMER")) SetTimingEnabled(true);
 }
 
 G4StepSolid::~G4StepSolid() {
@@ -633,6 +636,16 @@ void G4StepSolid::PrintTimingReport() const {
             total.dtoScalCount+= c->timing.dtoScalCount;
             total.normalNs    += c->timing.normalNs;
             total.normalCount += c->timing.normalCount;
+            // Sub-counters
+            total.rayFacesVisited  += c->timing.rayFacesVisited;
+            total.rayPerformCount  += c->timing.rayPerformCount;
+            total.rayHitsTotal     += c->timing.rayHitsTotal;
+            total.rayAnalyticCount += c->timing.rayAnalyticCount;
+            total.rayFallbackCount += c->timing.rayFallbackCount;
+            total.nfFacesVisited   += c->timing.nfFacesVisited;
+            total.nfExtremaCount   += c->timing.nfExtremaCount;
+            total.nfAnalyticCount  += c->timing.nfAnalyticCount;
+            total.nfFallbackCount  += c->timing.nfFallbackCount;
         }
     }
     G4cout << "[G4StepSolid timing] " << GetName() << G4endl;
@@ -642,6 +655,26 @@ void G4StepSolid::PrintTimingReport() const {
     PrintTimingRow("DistanceToOut(p,v)",  total.dtoVecNs,   total.dtoVecCount);
     PrintTimingRow("DistanceToOut(p)",    total.dtoScalNs,  total.dtoScalCount);
     PrintTimingRow("SurfaceNormal",       total.normalNs,   total.normalCount);
+    // Inner-loop sub-counters
+    int64_t dtiVecCalls = total.dtiVecCount;
+    int64_t dtoVecCalls = total.dtoVecCount;
+    int64_t vecCalls    = dtiVecCalls + dtoVecCalls;
+    int64_t nfCalls     = total.dtoScalCount + total.normalCount;
+    G4cout << "  -- RayCast inner (DistanceToIn/Out(p,v)) --" << G4endl;
+    G4cout << "    ray vec calls (DTI+DTO):   " << vecCalls << G4endl;
+    G4cout << "    ray faces visited (slab):  " << total.rayFacesVisited
+           << (vecCalls ? G4String("  (~") + std::to_string(total.rayFacesVisited/(vecCalls?vecCalls:1)) + " faces/call)" : "") << G4endl;
+    G4cout << "    ray Perform (OCCT):        " << total.rayPerformCount << G4endl;
+    G4cout << "    ray analytic hits:         " << total.rayAnalyticCount << G4endl;
+    G4cout << "    ray fallback hits:         " << total.rayFallbackCount << G4endl;
+    G4cout << "    ray total hits produced:   " << total.rayHitsTotal << G4endl;
+    G4cout << "  -- NearestFace (DistanceToOut(p) + SurfaceNormal) --" << G4endl;
+    G4cout << "    nf scalar+normal calls:    " << nfCalls << G4endl;
+    G4cout << "    nf faces visited (bbox):   " << total.nfFacesVisited
+           << (nfCalls ? G4String("  (~") + std::to_string(total.nfFacesVisited/(nfCalls?nfCalls:1)) + " faces/call)" : "") << G4endl;
+    G4cout << "    nf Extrema (OCCT):         " << total.nfExtremaCount << G4endl;
+    G4cout << "    nf analytic hits:          " << total.nfAnalyticCount << G4endl;
+    G4cout << "    nf fallback hits:          " << total.nfFallbackCount << G4endl;
 }
 
 void G4StepSolid::PrintAllTimingReports() {

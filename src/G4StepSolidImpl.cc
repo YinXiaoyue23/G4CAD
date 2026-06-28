@@ -234,9 +234,11 @@ G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const 
     AlgoCache* algo = GetAlgo();
     for (int i = 0; i < (int)fFaces.size(); ++i) {
         if (BBoxPointDist(fFaces[i].bbox, pt) >= result.dist) continue;
+        if (fTimingEnabled) ++algo->timing.nfFacesVisited;
         BRepExtrema_DistShapeShape& extrema = *algo->faceExtrema[i];
         extrema.LoadS1(vtxShape);
         extrema.Perform();
+        if (fTimingEnabled) ++algo->timing.nfExtremaCount;
         if (!extrema.IsDone()) continue;
         G4double d = extrema.Value();
         if (d < result.dist) {
@@ -269,13 +271,16 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     for (int fi = 0; fi < (int)fFaces.size(); ++fi) {
         const FaceEntry& fe = fFaces[fi];
         if (!rayHitsBox(ray.Location(), invDir, fe.bbox, octTol)) continue;
+        if (fTimingEnabled) ++algo->timing.rayFacesVisited;
 
         IntCurvesFace_Intersector& inter = *algo->faceIntersectors[fi];
         inter.Perform(ray, -octTol, kInfinity);
+        if (fTimingEnabled) ++algo->timing.rayPerformCount;
         for (int j = 1; j <= inter.NbPnt(); ++j) {
             rawHits.emplace_back(inter.WParameter(j), inter.Transition(j),
                                  fe.face, inter.UParameter(j), inter.VParameter(j));
         }
+        if (fTimingEnabled) algo->timing.rayHitsTotal += inter.NbPnt();
     }
 
     if (rawHits.empty()) {

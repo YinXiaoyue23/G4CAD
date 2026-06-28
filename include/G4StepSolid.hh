@@ -104,6 +104,18 @@ private:
         int64_t dtoVecNs    = 0, dtoVecCount    = 0;
         int64_t dtoScalNs   = 0, dtoScalCount   = 0;
         int64_t normalNs    = 0, normalCount     = 0;
+
+        // Inner-loop sub-counters: how many OCCT Perform() calls vs analytic hits.
+        // At baseline rayAnalytic/nfAnalytic == 0 (all OCCT); Task 2/3 flip these.
+        int64_t rayFacesVisited  = 0; // faces that passed slab test → fed to Intersector
+        int64_t rayPerformCount  = 0; // IntCurvesFace_Intersector::Perform calls (OCCT path)
+        int64_t rayHitsTotal     = 0; // total RayHit entries produced across all faces
+        int64_t rayAnalyticCount = 0; // analytic ray-face hits (Task 3, zero until then)
+        int64_t rayFallbackCount = 0; // OCCT fallback ray-face hits (Task 3, zero until then)
+        int64_t nfFacesVisited   = 0; // faces that passed bbox filter in NearestFace
+        int64_t nfExtremaCount   = 0; // BRepExtrema_DistShapeShape::Perform calls (OCCT path)
+        int64_t nfAnalyticCount  = 0; // analytic point-face distance hits (Task 2, zero until then)
+        int64_t nfFallbackCount  = 0; // OCCT fallback distance hits (Task 2, zero until then)
     };
 
     // Thread-local OCCT algorithm objects
