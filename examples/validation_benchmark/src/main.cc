@@ -18,8 +18,11 @@
 #include <chrono>
 #include <sstream>
 #include <vector>
+#include <random>
 #include <unistd.h>
 #include <limits.h>
+#include "G4VSolid.hh"
+#include "G4ThreeVector.hh"
 
 // ---------- helpers ----------
 
@@ -84,6 +87,10 @@ static void PrintUsage(const char* prog) {
 "Complex STEP case:\n"
 "  --complex-case <path>   Load and run arbitrary STEP file (no native comparison)\n"
 "  --skip-volume           Skip GetCubicVolume() in complex-case (avoids MC hang for 100+ face solids)\n"
+"  --inside-diff           Sample points in/around bbox, write per-point Inside() class to\n"
+"                          <output>_inside_diff.csv (seq,x,y,z,inside). Run twice (once normally,\n"
+"                          once with G4CAD_INSIDE_FORCE_OCCT=1) and diff to compare analytic vs OCCT.\n"
+"  --inside-diff-points <N>  Points for --inside-diff (default 200000)\n"
 "\n"
 "Output:\n"
 "  --output    <prefix>    Output file prefix (default \"output\")\n"
@@ -132,6 +139,8 @@ int main(int argc, char** argv) {
     std::string complex_case_file;
     bool   enable_root         = false;
     bool   skip_volume         = false;
+    bool   do_inside_diff      = false;
+    int    inside_diff_points  = 200000;
 
     // ---- option parsing ----
     static option long_opts[] = {
@@ -162,6 +171,8 @@ int main(int argc, char** argv) {
         {"geantino-test",            no_argument,       nullptr, 2004},
         {"complex-case",             required_argument, nullptr, 2006},
         {"skip-volume",              no_argument,       nullptr, 2008},
+        {"inside-diff",              no_argument,       nullptr, 2009},
+        {"inside-diff-points",       required_argument, nullptr, 2010},
         {"enable-root",              no_argument,       nullptr, 'r'},
         {"help",                     no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -197,6 +208,8 @@ int main(int argc, char** argv) {
             case 2004: do_geantino_test = true; break;
             case 2006: complex_case_file = optarg; break;
             case 2008: skip_volume  = true;   break;
+            case 2009: do_inside_diff = true; break;
+            case 2010: inside_diff_points = std::atoi(optarg); break;
             case 'r': enable_root   = true;   break;
             case 'h': PrintUsage(argv[0]); return 0;
             default:  PrintUsage(argv[0]); return 1;
@@ -253,6 +266,45 @@ int main(int argc, char** argv) {
                           << "  mem_delta=" << (mem_after - mem_before) << " MB\n";
 
             OutputWriter cwriter(output_prefix, enable_root);
+
+            // ---- Inside() differential dump (CT-IN gate 3a) ----
+            // Sample deterministic points in/around the bbox and record each
+            // point's combined Inside() classification across all solids. Run
+            // this twice (analytic vs G4CAD_INSIDE_FORCE_OCCT=1) and diff the
+            // CSVs to count analytic-vs-OCCT disagreements.
+            if (do_inside_diff) {
+                std::string dpath = output_prefix + "_inside_diff.csv";
+                std::ofstream df(dpath);
+                df << "seq,x,y,z,inside\n";
+                // Inflate bbox by 5% so the cloud straddles real surfaces.
+                double cx = 0.5*(xmin+xmax), cy = 0.5*(ymin+ymax), cz = 0.5*(zmin+zmax);
+                double hx = 0.55*(xmax-xmin), hy = 0.55*(ymax-ymin), hz = 0.55*(zmax-zmin);
+                std::mt19937_64 rng(1234567ULL);  // fixed seed → identical cloud both runs
+                std::uniform_real_distribution<double> ux(cx-hx, cx+hx);
+                std::uniform_real_distribution<double> uy(cy-hy, cy+hy);
+                std::uniform_real_distribution<double> uz(cz-hz, cz+hz);
+                int nIn=0, nSurf=0, nOut=0;
+                for (int s = 0; s < inside_diff_points; ++s) {
+                    G4ThreeVector pt(ux(rng), uy(rng), uz(rng));
+                    // Combined classification: kInside if inside any solid, else
+                    // kSurface if on any, else kOutside. (Same fold as physics use.)
+                    int comb = 0; // 0=out,1=surf,2=in
+                    for (auto* sol : solids) {
+                        EInside e = sol->Inside(pt);
+                        if (e == kInside)  { comb = 2; break; }
+                        if (e == kSurface) comb = std::max(comb, 1);
+                    }
+                    if      (comb == 2) ++nIn;
+                    else if (comb == 1) ++nSurf;
+                    else                ++nOut;
+                    df << s << ',' << pt.x() << ',' << pt.y() << ',' << pt.z() << ','
+                       << comb << '\n';
+                }
+                df.close();
+                std::cout << "[InsideDiff] wrote " << inside_diff_points << " points -> "
+                          << dpath << "  (in=" << nIn << " surf=" << nSurf
+                          << " out=" << nOut << ")\n";
+            }
 
             double wall_time = 0.0, eps = 0.0;
             if (n_events > 0) {

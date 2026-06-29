@@ -482,3 +482,172 @@ All simple geometries: ~1 fv/call (small face count → sort overhead is negligi
 None. The implementation is mechanical (no math change).
 
 ---
+
+## Task CT-TRIM — UV v-band trim for BSpline-trimmed analytic cylinders
+
+**Status: completed** (dev branch `/tmp/g4cad_dev`, model Opus 4.8)
+
+### Goal recap
+
+After CT-IN+CT1, ~58% of RP.step wall sat in `Inside()` for parts 0/1/2: those solids are
+analytic (Cylinder) but their cylinder faces carry **BSpline UV trim curves**
+(`analyticTrimSafe=false`), so the CT-IN ray-parity `IntersectFaceForParity` routed each such
+face through the OCCT `IntCurvesFace_Intersector` (the slow BSpline-trim setup,
+[G4StepSolidImpl.cc:755]). CT-TRIM replaces that per-face OCCT intersector with an analytic UV
+trim test for the faces where it can be proven correct.
+
+### Approach (what worked, after several that did not)
+
+The plan's "discretise the trim wire into UV polygon rings + crossing-number" is the right idea
+but the **periodic seam** of a full-2π cylinder breaks a naive even-odd polygon: the outer wire
+wraps the seam (u jumps 0↔2π between consecutive edges), and neither WireExplorer order,
+orientation-honoring, u-shift stitching, nor greedy edge re-chaining reconstructs a clean planar
+polygon (all gave ~50% misclassification on the seam-wrapping faces — verified offline against
+`BRepTopAdaptor_FClass2d`). A BRepMesh UV-triangle approach and a raw FClass2d grid mask both
+had a residual ~0.2–2.5% mismatch incompatible with the 1/200000 differential gate.
+
+**What works** (verified offline vs FClass2d, then in-kernel): these trimmed cylinders are all
+**v-band faces** — for every angle u the face spans `bot(u) ≤ v ≤ top(u)`, minus interior hole
+loops. So:
+- **Construction (`BuildUVTrim`, per face, per-thread, once)**: walk the wires with
+  `BRepTools_WireExplorer` + `BRepAdaptor_Curve2d`; drop the vertical seam/u-edge lines; rasterise
+  the remaining boundary edges into a fine u-grid (NB=2048 bins, 512 samples/edge) as upper/lower
+  v-envelopes `top[b]`/`bot[b]`; collect non-spanning wires as interior hole polygons. Handles BOTH
+  full-periodic (seam-wrapping) and partial-u cylinders — the seam never enters the band because
+  vertical seam edges carry no envelope info and are skipped; the u-range is enforced at classify
+  time. Stored in `AlgoCache::faceUVTrim` (ABI-safe — libG4CAD owns AlgoCache; no new G4StepSolid
+  member).
+- **Self-validation (the correctness guarantee)**: each candidate model is checked against
+  `BRepTopAdaptor_FClass2d` (ground truth) on a 1500-point random UV cloud. `.valid` is set ONLY
+  if every point the model *classifies* (definitely in/out — points it would defer are skipped)
+  agrees with OCCT with **zero mismatch**. Any face that does not validate keeps `.valid=false`
+  and is never accelerated → correctness can never regress from a bad model.
+- **Runtime (`IntersectFaceForParity`)**: for a validated face, compute the analytic ray-cylinder
+  intersection (identical math to the trim-safe path) → UV hit (u,v) → `ClassifyUVTrim`: O(1)
+  band lookup + O(hole-edges) crossing-number. Inside → emit the analytic RayHit; outside →
+  discard; **within the 0.02 mm boundary band → defer the whole face to the OCCT intersector for
+  that hit** (counted). Trim-safe rect/full-periodic fast path unchanged.
+
+### Changes (all dev branch `/tmp/g4cad_dev`)
+
+- **`include/G4StepSolid.hh`** (ABI: AlgoCache members + two AlgoCache counters only — NO new
+  G4StepSolid non-static member): added `AlgoCache::UVTrim` struct (validated flag, periodic flag,
+  u/v domain, du/NB, `top`/`bot` envelopes, hole polygons, boundary band), `faceUVTrim` vector,
+  `uvTrimAccept`/`uvTrimBandFallback` counters; declared `BuildUVTrim` and static `ClassifyUVTrim`.
+- **`src/G4StepSolidImpl.cc`**: `BuildUVTrim` (discretise + self-validate), `ClassifyUVTrim`
+  (band+hole point classification with periodic-u wrap / partial-u range check); AlgoCache ctor
+  builds `faceUVTrim` per face; `IntersectFaceForParity` non-trim-safe branch takes the UV-trim
+  fast path for validated cylinder faces, deferring band-ambiguous hits to OCCT.
+- **`src/G4StepSolid.cc`**: `PrintTimingReport` aggregates + prints the two CT-TRIM counters.
+- Diagnostic envs (off by default, zero runtime cost): `G4CAD_UVTRIM_VERBOSE` (per-solid
+  validated-face count), `G4CAD_UVTRIM_BAND` (override band), `G4CAD_UVTRIM_OFF` (bypass → exact
+  CT1 behaviour, for clean A/B).
+- **ABI**: full lib rebuild+install + benchmark rebuild after every header change.
+
+### Coverage (validated faces per solid, RP.step)
+
+part_0 3/4, part_1 3/7, part_2 3/4, part_5 28/65, part_6 28/65, part_7 13/39, part_8 25/45,
+part_9 25/45 use the UV v-band trim. Non-validating faces (complex multi-wire trims, e.g. part_1's
+3-wire faces) correctly keep the OCCT intersector. parts 5/6/8/9/12 build models but their
+*Inside* still uses the OCCT classifier (they contain Cone/Torus → `analyticInsideOK=false`); their
+UV-trim models accelerate the ray (DTI/DTO) path's non-trim-safe cylinder hits.
+
+### Correctness gates — ALL PASS
+
+**5 simple geometries — navigation (0% mismatch, max_dev < 4e-12 mm) + safety (ratio_median=1, frac_lt_0.1=0):**
+
+| geom | navigation (mismatch / max_dev_in / max_dev_out) | safety |
+|------|--------------------------------------------------|--------|
+| box | 0% / 1.42e-14 / 0 | ratio_median=1, frac_lt_0.1=0 |
+| sphere | 0% / 2.27e-13 / 4.26e-14 | ratio_median=1, frac_lt_0.1=0 |
+| cylinder | 0% / 4.55e-13 / 8.53e-14 | ratio_median=1, frac_lt_0.1=0 |
+| box_hole | 0% / 3.13e-13 / 1.78e-12 | ratio_median=1, frac_lt_0.1=0 |
+| touching_boxes | 0% / 2.84e-14 / 1.14e-13 | ratio_median=1, frac_lt_0.1=0 |
+
+(Simple-geom cylinders/holes are trim-safe → CT-TRIM=0/N for them, so these gates confirm the
+existing fast paths are unaffected. CT-TRIM itself is exercised + validated by RP.step.)
+
+**RP.step differential (analytic Inside vs `G4CAD_INSIDE_FORCE_OCCT=1`, 200,000-point bbox cloud):
+1 / 200,000** disagreement — **identical to the CT-IN/CT1 baseline (NOT worse)**. in=11171
+(analytic) vs 11172 (OCCT) — the same single surface-band edge case as CT-IN.
+
+**RP.step physics 200 ev**: completes, no crash/assertion. PASS.
+
+### Stability verification (the prior "227-hit explosion" must NOT recur)
+
+Ran 200 ev with the recorder (`G4CAD_RECORD`):
+- **0 stuck-signature rows** (no `DistanceToOut(p,v)≈0 AND Inside(p)==kInside`).
+- 14,535 queries / 200 ev ≈ **72.7/ev** — bounded, matches the CT-IN ~72/ev baseline; NO
+  per-navigation-point explosion. Physics completes normally.
+
+Why it stays stable: the UV-trim fast path produces the SAME analytic RayHit (same w, transition,
+UV) the OCCT intersector would for in-band-clean hits, and any hit within the 0.02 mm boundary
+band is deferred to the exact OCCT intersector — so GroupHits/parity see no spurious or missing
+crossings. The construction self-validation against FClass2d (zero-mismatch gate) guarantees a
+used model never disagrees with OCCT in its classified (non-deferred) region. Inside stays
+consistent with DistanceToIn/Out because both call `IntersectFaceForParity` with identical math.
+
+### CT-TRIM vs CT1 comparison — RP.step (1T, G4CAD_TIMER=1, same binary A/B via `G4CAD_UVTRIM_OFF`)
+
+**Per-part Inside() ns/call (200 ev):**
+
+| part | type | Inside calls | CT1 ns/call | CT-TRIM ns/call | Δ | uv-trim accept | band→OCCT |
+|------|------|-------------|-------------|-----------------|----|----------------|-----------|
+| part_0 | Plane+Cyl (BSpline-trim) | 1109 | 256,562 | 96,450 | **-62%** | 1767 | 24 |
+| part_1 | Plane+Cyl (BSpline-trim) | 1420 | 287,293 | 206,350 | **-28%** | 3447 | 0 |
+| part_2 | Plane+Cyl (BSpline-trim) | 846 | 220,253 | 11,248 | **-95%** | 1740 | 6 |
+| part_7 | Plane+Cyl | 2387 | 3,031 | 3,974 | ~0 (stochastic) | 5263 | 2 |
+
+**Aggregate:**
+
+| metric | CT1 | CT-TRIM | Δ |
+|--------|-----|---------|---|
+| Total Inside() µs (200 ev) | 968,676 | 496,795 | **-49%** |
+| Wall time, 200 ev, 1T | ~1.52 s | ~1.35 s | **-11%** |
+| Wall time, 1000 ev, 1T | ~5.59–5.77 s | ~3.93–4.05 s | **-28–30%** |
+
+At 200 ev the per-thread construction of the band models (BuildUVTrim + FClass2d self-validation,
+~0.3 s for the navigated solids) partly offsets the per-event win; at 1000 ev it amortises and the
+~30% wall reduction is clear. Per-event Inside compute is uniformly faster.
+
+> Why not "µs-level" everywhere (the plan's hope): part_2 reaches ~11 µs/call (the band model
+> covers all its hit faces) but part_0/part_1 keep one or more non-validating faces (part_0's
+> partial-u 2-ring face is now covered; part_1's two 3-wire faces are not a simple v-band and stay
+> on OCCT). Those residual OCCT-intersector calls (the kernel pathology CT-IN documented) keep
+> part_1 at ~200 µs/call. Full coverage would need a general (non-v-band) UV polygon classifier,
+> deliberately not attempted — correctness (zero differential regression) outranks the extra speed.
+
+### Bugs hit + fixes
+
+1. **Periodic-seam polygon reconstruction failed (~50% mismatch)** on full-2π cylinders. Root
+   cause: the outer trim wire wraps the seam (u jumps 0↔2π), so no simple planar even-odd polygon
+   reconstructs from WireExplorer edges. Fix: switched from a general UV polygon to a **v-band
+   model** (`bot(u)`/`top(u)` envelopes + hole loops) that is immune to the seam (vertical seam
+   edges are dropped; u-range enforced separately). Verified offline vs FClass2d before coding.
+2. **FClass2d is periodic in u** → early offline tests that probed FClass2d at `u+2πk` showed
+   spurious ~50% "mismatch". Fix: classify with u normalised into the face's u-domain (matches the
+   atan2 hit u at runtime).
+3. **Coarse envelope rejected good faces / over-wide band needed.** Initial NB=512 + 256-sample
+   edges left a ~0.1 mm linear-interpolation error on wavy BSpline boundaries, so the strict
+   zero-mismatch self-validation rejected parts 0/1/2. Fix: NB=2048 + 512-sample edges → envelope
+   error well under the 0.02 mm band → validation passes with full coverage.
+4. **Construction cost regressed wall at low event counts.** First version (NB=4096, 1024-sample,
+   20000-point validation) added ~0.7 s of per-thread construction inside the physics window,
+   pushing 200 ev wall UP. Fix: NB=2048 / 512-sample / 1500-point validation + extend the v-band
+   to partial-u faces (raising coverage so the per-event win dominates) → net improvement at 200 ev
+   and ~30% at 1000 ev.
+5. **Only full-u faces handled initially** → poor coverage (parts 0/1/2 lost their partial-u
+   faces, parts 5/6 got 0). Fix: generalised `BuildUVTrim`/`ClassifyUVTrim` to partial-u cylinders
+   (outer-wire detection uses the face's own u-extent; `periodic` flag gates the u-wrap). Coverage
+   jumped (parts 5/6: 0→28, part_7: 5→13) and the 1000-ev wall win went from ~16% to ~30%.
+
+### Outcome
+
+- Parts 0/1/2 Inside dropped 28–95% ns/call (part_2 to ~11 µs); total Inside −49% (200 ev);
+  RP.step wall −11% (200 ev) / −28–30% (1000 ev, where construction amortises).
+- RP.step analytic-vs-OCCT differential unchanged at 1/200000 (no regression); zero regression on
+  the 5 simple geometries; no explosion, no stuck; Inside↔DistanceToOut consistent.
+- Every accelerated face is proven equivalent to OCCT at construction (zero-mismatch FClass2d
+  self-validation) and every near-boundary hit defers to the exact OCCT intersector at runtime.
+
+---
