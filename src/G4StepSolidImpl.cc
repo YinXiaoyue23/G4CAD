@@ -201,22 +201,28 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
     for (size_t i = 0; i < nSolids; ++i)
         if (solidFaceIdx[i].empty()) analyticInsideOK[i] = 0;
 
-    // --- CT-TRIM: build + self-validate the UV v-band trim model per face ---
-    // Only non-trim-safe full-periodic cylinder faces produce a validated model; all
-    // others get .valid=false and keep the OCCT intersector path. Build is offline
-    // (per-thread, once) so its FClass2d cost is irrelevant to runtime navigation.
+    // --- CT-TRIM / CT-TRIM-2: build + self-validate the UV trim model per face ---
+    // BuildUVTrim tries a v-band model (CT-TRIM) and, for faces that are not a clean
+    // v-band (part_1's seam-notched full-2π cylinders), a general seam-aware polygon
+    // model (CT-TRIM-2). A model becomes .valid only on ZERO mismatch vs FClass2d;
+    // others keep .valid=false and the OCCT intersector path (no regression). Build is
+    // offline (per-thread, once) so its FClass2d cost is irrelevant to runtime navigation.
     {
         const int nF = (int)ownerSolid->fFaces.size();
         faceUVTrim.resize(nF);
-        int nValid = 0;
+        int nValid = 0, nBand = 0, nPoly = 0;
         const bool uvOff = (std::getenv("G4CAD_UVTRIM_OFF") != nullptr);  // A/B vs CT1
         for (int fi = 0; !uvOff && fi < nF; ++fi) {
             faceUVTrim[fi] = ownerSolid->BuildUVTrim(ownerSolid->fFaces[fi], occtTol);
-            if (faceUVTrim[fi].valid) ++nValid;
+            if (faceUVTrim[fi].valid) {
+                ++nValid;
+                if (faceUVTrim[fi].mode == UVTrim::Mode::Poly) ++nPoly; else ++nBand;
+            }
         }
         if (std::getenv("G4CAD_UVTRIM_VERBOSE"))
             G4cout << "[CT-TRIM] " << ownerSolid->GetName() << ": "
-                   << nValid << "/" << nF << " faces use UV v-band trim" << G4endl;
+                   << nValid << "/" << nF << " faces use UV trim ("
+                   << nBand << " band, " << nPoly << " polygon)" << G4endl;
     }
 
     // --- CT-IN: per-solid parity-direction selection ---
@@ -749,10 +755,35 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 // CT-TRIM: UV v-band trim model (build + classify)
 // ====================================================================
 //
-// ClassifyUVTrim — classify a UV hit (u,v) against a validated v-band model.
+// ---- Crossing-number point-in-ring test (a horizontal ray in +u at fixed v).
+// Counts ring edges the ray crosses; XORs winding. Sets nearEdge if the query is
+// within `band` (in u, at the crossing v) of a crossed edge → ambiguous.
+// The ring vertices are a closed polyline in the (u,v) plane.
+static inline int CrossingNumberRing(const std::vector<double>& ru,
+                                     const std::vector<double>& rv,
+                                     double uu, double v, double band,
+                                     bool& nearEdge) {
+    const size_t n = ru.size();
+    int wind = 0;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        double ui = ru[i], vi = rv[i], uj = ru[j], vj = rv[j];
+        if ((vi > v) != (vj > v)) {
+            double ut = uj + (v - vj) / (vi - vj) * (ui - uj);
+            if (uu < ut) wind ^= 1;
+            if (std::abs(uu - ut) < band) nearEdge = true;
+        }
+    }
+    return wind;
+}
+
+// ClassifyUVTrim — classify a UV hit (u,v) against a validated trim model.
 //   +1 inside face, 0 outside face, -1 ambiguous (within boundary band → use OCCT).
-// u is expected in the face period; it is wrapped into [u0,u1) for full-periodic
-// faces by the caller. Band membership: bot(u) ≤ v ≤ top(u) and not inside any hole.
+// u is expected in the face period; it is wrapped into [u0,u1) for full-periodic faces.
+//   Mode::Band  → bot(u) ≤ v ≤ top(u) minus holes (the original CT-TRIM model).
+//   Mode::Poly  → seam-aware crossing-number: inside the even-odd union of the outer
+//                 rings AND not inside any hole. Used for faces (part_1's full-2π
+//                 cylinders) whose outer trim carries a seam-crossing notch so a v-band
+//                 envelope is wrong near the seam.
 int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) {
     if (!t.valid) return -1;
     double uu = u;
@@ -769,6 +800,30 @@ int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) 
         if (uu < t.u0 - t.band || uu > t.u1 + t.band) return 0;  // off the face in u
         if (uu < t.u0 + t.band || uu > t.u1 - t.band) return -1; // near u-edge → defer
     }
+
+    if (t.mode == AlgoCache::UVTrim::Mode::Poly) {
+        // v outside the axial extent (with margin) → definitely off the face.
+        if (v < t.v0 - t.band || v > t.v1 + t.band) return 0;
+        // For a full-periodic Poly face the outer rings are closed in [u0,u1]×v (seam
+        // edges included). A horizontal +u ray at fixed v from uu would, for a periodic
+        // ring, need to wrap; instead we test uu directly against rings that already
+        // include the seam segments at u0/u1, so the ray stays within [u0,u1].
+        bool nearEdge = false;
+        int inOuter = 0;
+        for (size_t r = 0; r < t.outU.size(); ++r)
+            inOuter ^= CrossingNumberRing(t.outU[r], t.outV[r], uu, v, t.band, nearEdge);
+        if (nearEdge) return -1;        // near the outer boundary → defer to OCCT
+        if (!inOuter) return 0;         // outside the outer rings → off the face
+        for (size_t h = 0; h < t.holeU.size(); ++h) {
+            bool he = false;
+            int wind = CrossingNumberRing(t.holeU[h], t.holeV[h], uu, v, t.band, he);
+            if (he)   return -1;        // near a hole boundary → defer
+            if (wind) return 0;         // inside a hole → off the face
+        }
+        return 1;                       // inside outer, outside all holes → in face
+    }
+
+    // --- Band model ---
     int b = (int)((uu - t.u0) / t.du);
     if (b < 0) b = 0;
     if (b >= t.NB) b = t.NB - 1;
@@ -779,19 +834,8 @@ int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) 
     if (v < bot + t.band || v > top - t.band) return -1;  // near top/bot envelope → defer
     // Inside the band core → check holes. A hit inside a hole loop is OUTSIDE the face.
     for (size_t h = 0; h < t.holeU.size(); ++h) {
-        const std::vector<double>& hu = t.holeU[h];
-        const std::vector<double>& hv = t.holeV[h];
-        const size_t n = hu.size();
-        int wind = 0;
         bool nearEdge = false;
-        for (size_t i = 0, j = n - 1; i < n; j = i++) {
-            double ui = hu[i], vi = hv[i], uj = hu[j], vj = hv[j];
-            if ((vi > v) != (vj > v)) {
-                double ut = uj + (v - vj) / (vi - vj) * (ui - uj);
-                if (uu < ut) wind ^= 1;
-                if (std::abs(uu - ut) < t.band) nearEdge = true;
-            }
-        }
+        int wind = CrossingNumberRing(t.holeU[h], t.holeV[h], uu, v, t.band, nearEdge);
         if (nearEdge) return -1;       // near a hole boundary → defer to OCCT
         if (wind)     return 0;        // inside a hole → outside the face
     }
@@ -806,147 +850,234 @@ int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) 
 G4StepSolid::AlgoCache::UVTrim
 G4StepSolid::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
     AlgoCache::UVTrim t;
-    // Only full-periodic cylinder faces with a non-trivial (non-trim-safe) trim qualify.
+    // Only cylinder faces with a non-trivial (non-trim-safe) trim qualify.
     if (fe.surfType != FaceEntry::SurfType::Cylinder) return t;
     if (fe.analyticTrimSafe) return t;   // trim-safe faces already take the fast path
     const double u0 = fe.u0, u1 = fe.u1, v0 = fe.v0, v1 = fe.v1;
     const bool fullU = (u1 - u0 >= 2.0*M_PI - 1e-7);
     if (v1 <= v0 || u1 <= u0) return t;
-    // Both full-periodic and partial-u cylinder faces are modelled as a v-band
-    // bot(u) ≤ v ≤ top(u) (minus holes). Partial-u faces simply have no seam wrap; the
-    // ClassifyUVTrim u-wrap is a no-op when u already lies in [u0,u1]. Periodicity in u
-    // matters only for the outer-wire detection below (a full-periodic outer wire spans
-    // the whole 2π; a partial outer wire spans the face's own u-extent).
-
-    // Fine u-discretisation so the piecewise-linear envelope tracks the true (possibly
-    // BSpline) trim curve to well under the runtime boundary band. RP.step's trimmed
-    // cylinders span the full 2π at radii up to ~100 mm (arc length ~600 mm), with wavy
-    // BSpline cutouts → a coarse grid leaves a large linear-interpolation error near the
-    // wave crests. 2048 bins (+512-sample edges below) keep that error well under the
-    // 0.02 mm band; build cost stays small (offline, per-thread, once).
-    const int NB = 2048;
-    const double du = (u1 - u0) / NB;
-    std::vector<double> top(NB, -1e300), bot(NB, 1e300);
-    std::vector<std::vector<double>> holeU, holeV;
-
-    // Walk wires. The OUTER wire spans (nearly) the face's full u-extent; its non-seam
-    // edges form the top/bot envelope. Any wire that spans much less is an interior hole
-    // loop. Vertical edges at u≈u0 or u≈u1 (the periodic seam, or the u-edges of a
-    // partial-u face) carry no top/bot information and are skipped — the u-range check in
-    // ClassifyUVTrim handles the left/right boundary.
     const double uspan = u1 - u0;
     const TopoDS_Face& face = fe.face;
-    bool sawOuter = false;
-    for (TopExp_Explorer ew(face, TopAbs_WIRE); ew.More(); ew.Next()) {
-        TopoDS_Wire wire = TopoDS::Wire(ew.Current());
-        // Collect this wire's non-seam edge polylines and its overall u-extent.
-        std::vector<std::vector<std::pair<double,double>>> edgePolys;
-        double umin = 1e300, umax = -1e300;
-        for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
-            BRepAdaptor_Curve2d c2(we.Current(), face);
-            double t0 = c2.FirstParameter(), t1 = c2.LastParameter();
-            gp_Pnt2d a = c2.Value(t0), b = c2.Value(t1);
-            bool seam = (std::abs(a.X() - b.X()) < 1e-6 &&
-                         (std::abs(a.X() - u0) < 1e-3 || std::abs(a.X() - u1) < 1e-3));
-            if (seam) continue;
-            const int n = 512;
-            std::vector<std::pair<double,double>> poly;
-            poly.reserve(n + 1);
-            for (int i = 0; i <= n; ++i) {
-                double aa = (double)i / n;
-                double tt = t0 + (t1 - t0) * aa;
-                gp_Pnt2d q = c2.Value(tt);
-                poly.emplace_back(q.X(), q.Y());
-                umin = std::min(umin, q.X());
-                umax = std::max(umax, q.X());
-            }
-            edgePolys.push_back(std::move(poly));
-        }
-        if (edgePolys.empty()) continue;
-        bool outer = (umax - umin >= uspan - std::max(1e-2, 1e-2*uspan));
-        if (outer) {
-            sawOuter = true;
-            // Rasterise each boundary segment into the u-bins it spans, accumulating
-            // the upper (top) and lower (bot) v-envelope by linear interpolation.
-            for (const auto& poly : edgePolys) {
-                for (size_t i = 0; i + 1 < poly.size(); ++i) {
-                    double ua = poly[i].first,  va = poly[i].second;
-                    double ub = poly[i+1].first, vb = poly[i+1].second;
-                    if (ua > ub) { std::swap(ua, ub); std::swap(va, vb); }
-                    int ba = (int)((ua - u0) / du), bb = (int)((ub - u0) / du);
-                    ba = std::max(0, std::min(NB-1, ba));
-                    bb = std::max(0, std::min(NB-1, bb));
-                    for (int b = ba; b <= bb; ++b) {
-                        double uc = u0 + (b + 0.5) * du;
-                        double vv = (ub > ua) ? va + (vb - va) * ((uc - ua)/(ub - ua)) : va;
-                        if (uc < ua) vv = va;
-                        if (uc > ub) vv = vb;
-                        top[b] = std::max(top[b], vv);
-                        bot[b] = std::min(bot[b], vv);
-                    }
-                }
-            }
-        } else {
-            // Interior hole loop: concatenate its edge polylines into one closed ring.
-            std::vector<double> hu, hv;
-            for (const auto& poly : edgePolys)
-                for (const auto& q : poly) { hu.push_back(q.first); hv.push_back(q.second); }
-            if (hu.size() >= 3) { holeU.push_back(std::move(hu)); holeV.push_back(std::move(hv)); }
-        }
-    }
-    if (!sawOuter) return t;
-    // Fill any u-bins that received no boundary sample by nearest-neighbour propagation.
-    for (int b = 1;     b < NB; ++b) if (top[b] < -1e299) { top[b] = top[b-1]; bot[b] = bot[b-1]; }
-    for (int b = NB-2;  b >= 0; --b) if (top[b] < -1e299) { top[b] = top[b+1]; bot[b] = bot[b+1]; }
-    // A degenerate face (all bins empty) cannot be modelled.
-    for (int b = 0; b < NB; ++b) if (top[b] < -1e299) return t;
+    const bool dbg = (std::getenv("G4CAD_UVTRIM_DEBUG") != nullptr);
 
-    t.u0 = u0; t.u1 = u1; t.v0 = v0; t.v1 = v1; t.du = du; t.NB = NB;
+    // Runtime boundary band (UV units). v maps 1:1 to mm (axial). Any hit within this of
+    // an envelope / polygon / hole edge is deferred to the exact OCCT intersector.
+    double band = 0.02;
+    if (const char* be = std::getenv("G4CAD_UVTRIM_BAND")) band = std::atof(be);
+    t.band = band;
+    t.u0 = u0; t.u1 = u1; t.v0 = v0; t.v1 = v1;
     t.periodic = fullU;
-    t.top = std::move(top); t.bot = std::move(bot);
-    t.holeU = std::move(holeU); t.holeV = std::move(holeV);
-    // Runtime boundary band. v maps 1:1 to mm (axial); u (angle) is classified against
-    // the same band on the hole edges. The piecewise-linear envelope of a 256-sample
-    // BSpline edge deviates from the true curve by far less than this, so any hit within
-    // the band of the envelope/holes is deferred to the OCCT trim-exact intersector. The
-    // band must be wide enough that the fast path is only taken where the model is
-    // PROVABLY correct (confirmed by the self-validation below, run WITH this band).
-    // Default 0.02 mm: with NB=2048 bins and 512-sample edges the piecewise-linear
-    // envelope tracks RP.step's BSpline trim curves to well within this, so the
-    // self-validation below passes for the genuine v-band faces (parts 0/1/2/5/6/7/8/9)
-    // while any hit within 0.02 mm of the trim boundary defers to the exact OCCT path.
-    t.band = 0.02;
-    if (const char* be = std::getenv("G4CAD_UVTRIM_BAND")) t.band = std::atof(be);
-    t.valid = true;   // provisional — confirmed by the self-validation below
 
-    // --- Self-validation against BRepTopAdaptor_FClass2d (ground truth) ---
-    // Dense random UV cloud over [u0,u1]×[v0,v1]. Points the model would DEFER at
-    // runtime (cls==-1, boundary band) are skipped — those take the exact OCCT path and
-    // cannot be wrong. We require ZERO disagreement on the points the fast path actually
-    // CLASSIFIES (cls∈{0,1}): a definitely-in/out verdict must match OCCT exactly. If any
-    // such core point disagrees, the band model is unsafe for this face → reject it.
-    // valN kept modest: each FClass2d::Perform is ~15 µs, and validation runs per
-    // candidate face per thread at construction. 3000 random core points reliably
-    // catch any systematic band-model error (a wrong envelope misclassifies a large
-    // contiguous region, so even a sparse sample hits it) while keeping the one-time
-    // construction cost small. Correctness at runtime does not depend on valN — a
-    // surviving model is also guarded per-hit by the boundary band → OCCT deferral.
+    // --- Self-validation against BRepTopAdaptor_FClass2d (ground truth) ----------
+    // Dense random UV cloud over [u0,u1]×[v0,v1]. Points the model would DEFER (cls==-1,
+    // boundary band) are skipped — those take the exact OCCT path and cannot be wrong. We
+    // require ZERO disagreement on the points the fast path actually CLASSIFIES
+    // (cls∈{0,1}). A systematic model error misclassifies a large contiguous region, so a
+    // sparse random sample reliably hits it. This is the safety net: a model that does not
+    // validate keeps .valid=false and is never accelerated → correctness can't regress.
     BRepTopAdaptor_FClass2d fclass(face, 1e-9);
-    std::mt19937_64 rng(0x5UL * (uint64_t)(uintptr_t)&fe + 0x9E3779B97F4A7C15ULL);
-    std::uniform_real_distribution<double> ru(u0, u1), rv(v0, v1);
-    const int valN = 1500;
-    int mism = 0;
-    for (int k = 0; k < valN && mism == 0; ++k) {
-        double u = ru(rng), v = rv(rng);
-        int cls = ClassifyUVTrim(t, u, v);
-        if (cls < 0) continue;                         // would defer to OCCT → never wrong
-        TopAbs_State st = fclass.Perform(gp_Pnt2d(u, v));
-        if (st == TopAbs_ON) continue;                 // OCCT on-boundary → ambiguous, skip
-        bool myIn  = (cls == 1);
-        bool occtIn = (st == TopAbs_IN);
-        if (myIn != occtIn) ++mism;
+    auto selfValidate = [&](AlgoCache::UVTrim& cand, const char* tag) -> int {
+        std::mt19937_64 rng(0x5UL * (uint64_t)(uintptr_t)&fe + 0x9E3779B97F4A7C15ULL);
+        std::uniform_real_distribution<double> ru(u0, u1), rv(v0, v1);
+        const int valN = dbg ? 20000 : 2000;
+        int mism = 0, dbgShown = 0;
+        for (int k = 0; k < valN && (dbg || mism == 0); ++k) {
+            double u = ru(rng), v = rv(rng);
+            int cls = ClassifyUVTrim(cand, u, v);
+            if (cls < 0) continue;                  // deferred → never wrong
+            TopAbs_State st = fclass.Perform(gp_Pnt2d(u, v));
+            if (st == TopAbs_ON) continue;          // OCCT on-boundary → skip
+            bool myIn = (cls == 1), occtIn = (st == TopAbs_IN);
+            if (myIn != occtIn) {
+                ++mism;
+                if (dbg && dbgShown < 8) { ++dbgShown;
+                    G4cout << "[UVTRIM-DBG]     " << tag << " MISM u=" << u << " v=" << v
+                           << " myIn=" << myIn << " occtIn=" << occtIn << G4endl; }
+            }
+        }
+        if (dbg) G4cout << "[UVTRIM-DBG]   " << tag << " validationMism(of " << valN
+                        << ")=" << mism << G4endl;
+        return mism;
+    };
+
+    // ============================================================================
+    // ATTEMPT 1 — v-band model (the CT-TRIM model). Covers faces whose outer trim is
+    // a single bot(u)≤v≤top(u) envelope (parts 0/2/5/6/7/8/9). Cheapest classify.
+    // ============================================================================
+    {
+        const int NB = 2048;
+        const double du = (u1 - u0) / NB;
+        std::vector<double> top(NB, -1e300), bot(NB, 1e300);
+        std::vector<std::vector<double>> holeU, holeV;
+        bool sawOuter = false;
+        for (TopExp_Explorer ew(face, TopAbs_WIRE); ew.More(); ew.Next()) {
+            TopoDS_Wire wire = TopoDS::Wire(ew.Current());
+            std::vector<std::vector<std::pair<double,double>>> edgePolys;
+            double umin = 1e300, umax = -1e300;
+            for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
+                BRepAdaptor_Curve2d c2(we.Current(), face);
+                double t0 = c2.FirstParameter(), t1 = c2.LastParameter();
+                gp_Pnt2d a = c2.Value(t0), b = c2.Value(t1);
+                bool seam = (std::abs(a.X() - b.X()) < 1e-6 &&
+                             (std::abs(a.X() - u0) < 1e-3 || std::abs(a.X() - u1) < 1e-3));
+                if (seam) continue;
+                const int n = 512;
+                std::vector<std::pair<double,double>> poly; poly.reserve(n + 1);
+                for (int i = 0; i <= n; ++i) {
+                    double tt = t0 + (t1 - t0) * ((double)i / n);
+                    gp_Pnt2d q = c2.Value(tt);
+                    poly.emplace_back(q.X(), q.Y());
+                    umin = std::min(umin, q.X()); umax = std::max(umax, q.X());
+                }
+                edgePolys.push_back(std::move(poly));
+            }
+            if (edgePolys.empty()) continue;
+            bool outer = (umax - umin >= uspan - std::max(1e-2, 1e-2*uspan));
+            if (outer) {
+                sawOuter = true;
+                for (const auto& poly : edgePolys)
+                    for (size_t i = 0; i + 1 < poly.size(); ++i) {
+                        double ua = poly[i].first,  va = poly[i].second;
+                        double ub = poly[i+1].first, vb = poly[i+1].second;
+                        if (ua > ub) { std::swap(ua, ub); std::swap(va, vb); }
+                        int ba = std::max(0, std::min(NB-1, (int)((ua - u0) / du)));
+                        int bb = std::max(0, std::min(NB-1, (int)((ub - u0) / du)));
+                        for (int b = ba; b <= bb; ++b) {
+                            double uc = u0 + (b + 0.5) * du;
+                            double vv = (ub > ua) ? va + (vb - va)*((uc - ua)/(ub - ua)) : va;
+                            if (uc < ua) vv = va;
+                            if (uc > ub) vv = vb;
+                            top[b] = std::max(top[b], vv);
+                            bot[b] = std::min(bot[b], vv);
+                        }
+                    }
+            } else {
+                std::vector<double> hu, hv;
+                for (const auto& poly : edgePolys)
+                    for (const auto& q : poly) { hu.push_back(q.first); hv.push_back(q.second); }
+                if (hu.size() >= 3) { holeU.push_back(std::move(hu)); holeV.push_back(std::move(hv)); }
+            }
+        }
+        bool degenerate = !sawOuter;
+        if (!degenerate) {
+            for (int b = 1;    b < NB; ++b) if (top[b] < -1e299) { top[b]=top[b-1]; bot[b]=bot[b-1]; }
+            for (int b = NB-2; b >= 0; --b) if (top[b] < -1e299) { top[b]=top[b+1]; bot[b]=bot[b+1]; }
+            for (int b = 0; b < NB; ++b) if (top[b] < -1e299) { degenerate = true; break; }
+        }
+        if (!degenerate) {
+            AlgoCache::UVTrim band_t = t;
+            band_t.mode = AlgoCache::UVTrim::Mode::Band;
+            band_t.du = du; band_t.NB = NB;
+            band_t.top = top; band_t.bot = bot;
+            band_t.holeU = holeU; band_t.holeV = holeV;
+            band_t.valid = true;
+            if (dbg) G4cout << "[UVTRIM-DBG] cyl R=" << fe.cylR << " u=[" << u0 << "," << u1
+                            << "] v=[" << v0 << "," << v1 << "] fullU=" << fullU
+                            << " : try BAND nHoles=" << holeU.size() << G4endl;
+            if (selfValidate(band_t, "BAND") == 0) return band_t;   // band model is exact
+        }
     }
-    if (mism != 0) { t.valid = false; return t; }       // core disagreement → reject
+
+    // ============================================================================
+    // ATTEMPT 2 — general seam-aware polygon model (CT-TRIM-2). For faces whose outer
+    // trim is NOT a clean v-band (part_1's full-2π cylinders with a seam-crossing
+    // notch). Reconstruct every wire (seam edges INCLUDED) as a closed UV ring in the
+    // [u0,u1]×v plane by endpoint chaining, then classify by crossing-number:
+    // inside the even-odd union of the large rings (outer) AND not inside any small
+    // ring (hole). The seam is handled because the rings carry the vertical seam
+    // segments at u0/u1 explicitly — no unwrapping, no ±2π query shifting needed.
+    // ============================================================================
+    if (std::getenv("G4CAD_UVTRIM_NOPOLY") == nullptr) {
+        // Per-wire: build closed UV rings by chaining oriented edge polylines.
+        std::vector<std::vector<double>> outU, outV, holeU, holeV;
+        const double chainTol = 1e-4;              // endpoint match tolerance in UV
+        bool buildFail = false;
+        for (TopExp_Explorer ew(face, TopAbs_WIRE); ew.More(); ew.Next() ) {
+            TopoDS_Wire wire = TopoDS::Wire(ew.Current());
+            // Collect oriented edge polylines (apply edge orientation so each runs
+            // start→end along the wire's traversal direction).
+            struct Seg { std::vector<std::pair<double,double>> pts; };
+            std::vector<Seg> segs;
+            double wvmin = 1e300, wvmax = -1e300, wumin = 1e300, wumax = -1e300;
+            for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
+                BRepAdaptor_Curve2d c2(we.Current(), face);
+                double t0 = c2.FirstParameter(), t1 = c2.LastParameter();
+                const int n = 256;
+                Seg s; s.pts.reserve(n + 1);
+                for (int i = 0; i <= n; ++i) {
+                    double tt = t0 + (t1 - t0) * ((double)i / n);
+                    gp_Pnt2d q = c2.Value(tt);
+                    s.pts.emplace_back(q.X(), q.Y());
+                    wumin = std::min(wumin, q.X()); wumax = std::max(wumax, q.X());
+                    wvmin = std::min(wvmin, q.Y()); wvmax = std::max(wvmax, q.Y());
+                }
+                if (we.Current().Orientation() == TopAbs_REVERSED)
+                    std::reverse(s.pts.begin(), s.pts.end());
+                segs.push_back(std::move(s));
+            }
+            if (segs.empty()) continue;
+            // Greedy chain: start from seg 0, repeatedly attach the unused seg whose
+            // start (or end, reversing) matches the current chain end within chainTol.
+            // A periodic seam is fine: a seam edge at u0 and one at u1 are distinct
+            // segments whose endpoints match their neighbours in the [u0,u1] plane.
+            std::vector<char> used(segs.size(), 0);
+            std::vector<std::pair<double,double>> ring;
+            auto appendSeg = [&](std::vector<std::pair<double,double>>& dst,
+                                 const std::vector<std::pair<double,double>>& src,
+                                 bool skipFirst) {
+                for (size_t i = skipFirst ? 1 : 0; i < src.size(); ++i) dst.push_back(src[i]);
+            };
+            appendSeg(ring, segs[0].pts, false);
+            used[0] = 1;
+            size_t attached = 1;
+            while (attached < segs.size()) {
+                double ex = ring.back().first, ey = ring.back().second;
+                int best = -1; bool bestRev = false; double bestD = chainTol;
+                for (size_t s = 0; s < segs.size(); ++s) {
+                    if (used[s]) continue;
+                    double sx = segs[s].pts.front().first, sy = segs[s].pts.front().second;
+                    double tx = segs[s].pts.back().first,  ty = segs[s].pts.back().second;
+                    double d0 = std::hypot(ex - sx, ey - sy);
+                    double d1 = std::hypot(ex - tx, ey - ty);
+                    if (d0 <= bestD) { bestD = d0; best = (int)s; bestRev = false; }
+                    if (d1 <  bestD) { bestD = d1; best = (int)s; bestRev = true;  }
+                }
+                if (best < 0) { buildFail = true; break; }   // chain broke → bail to OCCT
+                std::vector<std::pair<double,double>> sp = segs[best].pts;
+                if (bestRev) std::reverse(sp.begin(), sp.end());
+                appendSeg(ring, sp, true);
+                used[best] = 1; ++attached;
+            }
+            if (buildFail) break;
+            // Ring must close (last ≈ first within a looser tol; the seam may leave a
+            // small gap). If it does not close, the chaining is unreliable → bail.
+            double cx = ring.front().first - ring.back().first;
+            double cy = ring.front().second - ring.back().second;
+            if (std::hypot(cx, cy) > 1e-2) { buildFail = true; break; }
+            std::vector<double> ru_, rv_;
+            ru_.reserve(ring.size()); rv_.reserve(ring.size());
+            for (auto& q : ring) { ru_.push_back(q.first); rv_.push_back(q.second); }
+            // Classify ring as outer vs hole by its u-extent: an outer ring of a
+            // full-2π face spans (nearly) the whole period; a hole is local. For a
+            // partial-u face the outer ring spans the face's u-extent.
+            bool isOuter = (wumax - wumin >= uspan - std::max(1e-2, 1e-2*uspan));
+            if (isOuter) { outU.push_back(std::move(ru_)); outV.push_back(std::move(rv_)); }
+            else         { holeU.push_back(std::move(ru_)); holeV.push_back(std::move(rv_)); }
+        }
+        if (!buildFail && !outU.empty()) {
+            AlgoCache::UVTrim poly_t = t;
+            poly_t.mode = AlgoCache::UVTrim::Mode::Poly;
+            poly_t.outU = outU; poly_t.outV = outV;
+            poly_t.holeU = holeU; poly_t.holeV = holeV;
+            poly_t.valid = true;
+            if (dbg) G4cout << "[UVTRIM-DBG]   try POLY nOuter=" << outU.size()
+                            << " nHoles=" << holeU.size() << G4endl;
+            if (selfValidate(poly_t, "POLY") == 0) return poly_t;  // polygon model exact
+        }
+    }
+
+    // Neither model validated → keep .valid=false (OCCT intersector path, no regression).
+    if (dbg) G4cout << "[UVTRIM-DBG]   -> NO VALID MODEL (keep OCCT)" << G4endl;
     return t;
 }
 

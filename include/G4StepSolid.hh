@@ -239,10 +239,23 @@ private:
         //
         // Indexed by global face index (owner->fFaces). ABI-safe: libG4CAD owns AlgoCache.
         struct UVTrim {
-            bool   valid = false;        // band model validated → safe to use at runtime
+            bool   valid = false;        // model validated → safe to use at runtime
             bool   periodic = false;     // full 2π in u → wrap hit u into [u0,u1)
             double u0 = 0, u1 = 0;       // face u-domain (full period: u1-u0 ≈ 2π)
             double v0 = 0, v1 = 0;       // face v-domain (axial range)
+
+            // CT-TRIM-2: two model kinds. The v-band model (mode==Band) covers faces
+            // whose outer trim is a single bot(u)≤v≤top(u) envelope (parts 0/2/5/6/…).
+            // The general-polygon model (mode==Poly) covers faces whose outer trim is
+            // NOT a clean v-band — e.g. part_1's full-2π cylinder faces whose outer
+            // wire carries a seam-crossing notch (so top(u)/bot(u) is wrong near the
+            // seam). For those the outer boundary is stored as one or more closed UV
+            // rings reconstructed (seam-aware) in the [u0,u1]×v plane; classification
+            // is a crossing-number point-in-polygon-with-holes test.
+            enum class Mode : uint8_t { Band = 0, Poly = 1 };
+            Mode   mode = Mode::Band;
+
+            // --- Band model (mode==Band) ---
             double du = 0;               // (u1-u0)/NB  (bin width)
             int    NB = 0;               // number of u-bins
             // top[b]/bot[b]: piecewise-linear upper/lower v-envelope sampled at bin
@@ -252,9 +265,19 @@ private:
             // inside any hole is OUTSIDE the face. Holes never wrap the seam (they are
             // local), so a plain even-odd test in (u,v) is exact for them.
             std::vector<std::vector<double>> holeU, holeV;
-            // Boundary band (UV units): if |v - bot| or |v - top| (or distance to a hole
-            // edge) is within this, the classification is ambiguous → defer THAT hit to
-            // the OCCT intersector. Sized from the navigation tolerance mapped to v.
+
+            // --- General polygon model (mode==Poly) ---
+            // Outer boundary rings reconstructed in the [u0,u1]×v plane (seam edges
+            // INCLUDED, so each ring is a closed polygon that respects the seam). The
+            // face interior is the even-odd union of these rings. Holes (interior loops)
+            // are stored in holeU/holeV above and subtracted. A point is in the face iff
+            // it is inside the outer rings (odd winding) AND not inside any hole.
+            std::vector<std::vector<double>> outU, outV;
+
+            // Boundary band (UV units): if a hit is within this of any polygon/envelope
+            // edge the classification is ambiguous → defer THAT hit to the OCCT
+            // intersector. For the Poly model the band is applied as a u/v distance to
+            // the nearest crossed edge.
             double band = 0;
         };
         std::vector<UVTrim>            faceUVTrim;       // per global face index
