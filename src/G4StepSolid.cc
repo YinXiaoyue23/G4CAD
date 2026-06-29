@@ -729,10 +729,13 @@ namespace {
 
 void G4StepSolid::PrintTimingReport() const {
     TimingStats total;
+    int64_t uvTrimAccept = 0, uvTrimBandFallback = 0;  // CT-TRIM (AlgoCache members)
     {
         std::lock_guard<std::mutex> lock(sAllCachesMutex);
         for (const AlgoCache* c : sAllCaches) {
             if (c->owner != this) continue;
+            uvTrimAccept       += c->uvTrimAccept;
+            uvTrimBandFallback += c->uvTrimBandFallback;
             total.insideNs    += c->timing.insideNs;
             total.insideCount += c->timing.insideCount;
             total.dtiVecNs    += c->timing.dtiVecNs;
@@ -789,6 +792,9 @@ void G4StepSolid::PrintTimingReport() const {
     G4cout << "  -- Inside (CT-IN: analytic ray parity vs OCCT classifier) --" << G4endl;
     G4cout << "    inside analytic (parity):  " << total.insideAnalyticCount << G4endl;
     G4cout << "    inside fallback (OCCT):    " << total.insideFallbackCount << G4endl;
+    G4cout << "  -- CT-TRIM (UV v-band trim for BSpline-trimmed cylinders) --" << G4endl;
+    G4cout << "    uv-trim analytic accept:   " << uvTrimAccept << G4endl;
+    G4cout << "    uv-trim band → OCCT:       " << uvTrimBandFallback << G4endl;
 }
 
 void G4StepSolid::PrintAllTimingReports() {

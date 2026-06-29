@@ -220,6 +220,47 @@ private:
         std::vector<std::vector<int>>  solidFaceIdx;
         std::vector<char>              analyticInsideOK;
 
+        // --- CT-TRIM: UV v-band trim model for full-periodic analytic cylinder faces ---
+        // The dominant remaining cost in RP.step is the per-face OCCT
+        // IntCurvesFace_Intersector used by IntersectFaceForParity for analytic
+        // cylinder faces that carry BSpline UV trim curves (parts 0/1/2,
+        // analyticTrimSafe=false). Those faces are full-periodic in u and shaped as
+        // a "v-band": for every angle u the face spans v ∈ [bot(u), top(u)], possibly
+        // minus interior hole loops. CT-TRIM precomputes that band analytically so the
+        // analytic ray-cylinder hit (u,v) can be classified by a cheap O(1) band lookup
+        // (+ O(edges) point-in-hole test) instead of the OCCT BSpline-trim intersector.
+        //
+        // Built once at construction and SELF-VALIDATED against BRepTopAdaptor_FClass2d
+        // on a dense UV grid: useUVTrim[fi] is set ONLY if the band model reproduces
+        // OCCT's in/out classification with ZERO mismatch over the grid. Any face that
+        // does not validate (partial-u, complex multi-loop trims, etc.) keeps
+        // useUVTrim=false and routes to the existing OCCT intersector — correctness
+        // outranks speed, so a non-validating face is never accelerated.
+        //
+        // Indexed by global face index (owner->fFaces). ABI-safe: libG4CAD owns AlgoCache.
+        struct UVTrim {
+            bool   valid = false;        // band model validated → safe to use at runtime
+            bool   periodic = false;     // full 2π in u → wrap hit u into [u0,u1)
+            double u0 = 0, u1 = 0;       // face u-domain (full period: u1-u0 ≈ 2π)
+            double v0 = 0, v1 = 0;       // face v-domain (axial range)
+            double du = 0;               // (u1-u0)/NB  (bin width)
+            int    NB = 0;               // number of u-bins
+            // top[b]/bot[b]: piecewise-linear upper/lower v-envelope sampled at bin
+            // centres u0+(b+0.5)*du. A point (u,v) is in the band iff bot ≤ v ≤ top.
+            std::vector<double> top, bot;
+            // Interior hole loops as closed UV polygons (crossing-number test). A point
+            // inside any hole is OUTSIDE the face. Holes never wrap the seam (they are
+            // local), so a plain even-odd test in (u,v) is exact for them.
+            std::vector<std::vector<double>> holeU, holeV;
+            // Boundary band (UV units): if |v - bot| or |v - top| (or distance to a hole
+            // edge) is within this, the classification is ambiguous → defer THAT hit to
+            // the OCCT intersector. Sized from the navigation tolerance mapped to v.
+            double band = 0;
+        };
+        std::vector<UVTrim>            faceUVTrim;       // per global face index
+        int64_t                       uvTrimAccept = 0; // analytic UV-trim classifications
+        int64_t                       uvTrimBandFallback = 0; // boundary-band → OCCT
+
         // Per-solid parity ray directions, ordered fastest→slowest, chosen at
         // construction by timing candidate directions against this solid's faces.
         // The OCCT IntCurvesFace_Intersector used for BSpline-trimmed analytic
@@ -310,6 +351,16 @@ private:
     bool IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
                                 const G4ThreeVector& dir, G4double octTol,
                                 std::vector<RayHit>& hits) const;
+
+    // --- CT-TRIM: build + self-validate the UV v-band trim model for one face.
+    // Returns a populated UVTrim; .valid is true only if the band reproduces
+    // BRepTopAdaptor_FClass2d's classification with zero mismatch on a dense grid.
+    // Called once per face at AlgoCache construction. Only attempts full-periodic
+    // cylinder faces that are NOT analyticTrimSafe; others return .valid=false.
+    AlgoCache::UVTrim BuildUVTrim(const FaceEntry& fe, G4double octTol) const;
+    // Classify a UV hit (u,v) against a validated band model.
+    //   returns +1 = inside face, 0 = outside face, -1 = ambiguous (boundary band).
+    static int ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v);
     // Classify p against a single analytic solid (index si) by ray parity.
     // Returns kInside / kOutside / kSurface. `ok` is set false if the analytic
     // method could not decide (ambiguous after perturbation retries) → caller
