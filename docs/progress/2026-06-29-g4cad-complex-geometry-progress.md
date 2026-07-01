@@ -651,3 +651,216 @@ At 200 ev the per-thread construction of the band models (BuildUVTrim + FClass2d
   self-validation) and every near-boundary hit defers to the exact OCCT intersector at runtime.
 
 ---
+
+## Task CT-TRIM-2 — general seam-aware UV polygon trim (crack part_1's #1 cost)
+
+**Status: completed** (dev branch `/tmp/g4cad_dev`, model Opus 4.8)
+
+### Goal recap
+
+After CT-TRIM, the single biggest remaining RP.step cost was **part_1 `Inside()` = ~213k ns/call,
+~302 ms total @200 ev** (the #1 line in the timer). Cause: CT-TRIM's UV-trim test handles only
+**v-band** faces (`bot(u) ≤ v ≤ top(u)` minus holes). part_1 has **2 full-2π cylinder faces (R=75,
+R=77) whose outer trim wire carries a seam-crossing notch**, so it is NOT v-band-expressible — those
+faces fell through to the per-ray OCCT `IntCurvesFace_Intersector` (the BSpline-trim kernel pathology,
+~100k ns/face). part_2 was already fully fixed by CT-TRIM because its trims ARE v-band. CT-TRIM-2
+extends the classifier to a **general seam-aware crossing-number point-in-polygon-with-holes** test so
+those non-v-band analytic faces also get analytic trim classification.
+
+### Root-cause investigation (the part_1 faces)
+
+A construction-time diagnostic (`G4CAD_UVTRIM_DEBUG`, dumps each cylinder face's wires/edges +
+per-point FClass2d validation mismatches) pinned the two offending faces:
+
+- **R=77, full 2π, v=[-56,56], 3 wires**: outer wire#0 = 9 edges (5 seam) with a curved cutout
+  straddling u≈0 and a second near u≈2π (the "notch"); wire#1, wire#2 = interior circular holes.
+- **R=75, full 2π, v=[-56,56], 3 wires**: same shape.
+
+The v-band model fills `top=+56, bot=-56` near the seam, but the real face EXCLUDES the notch there →
+**2047/20000 validation mismatches (10%), all `myIn=1 occtIn=0`, clustered at u≈0 and u≈2π**. So the
+v-band is genuinely wrong on the seam — confirming the task framing. (This is exactly the "naive
+polygon unworkable on the seam" problem CT-TRIM hit; CT-TRIM-2 solves it.)
+
+### Approach (what works)
+
+The key realisation from the edge dump: **a full-periodic cylinder's outer wire, with the seam edges
+INCLUDED, is already a closed polygon in the `[u0,u1]×v` rectangle** — the seam is represented by
+vertical edges at u=u0 and u=u1 that close the ring at the rectangle's left/right boundary. No
+unwrapping or ±2π query shifting is needed; the crossing-number ray (horizontal +u at fixed v) stays
+inside `[u0,u1]` because the ring carries the right seam segment as an ordinary polygon edge.
+
+`BuildUVTrim` now tries two models, cheapest first, each gated by the SAME zero-mismatch FClass2d
+self-validation:
+
+1. **Band model (CT-TRIM)** — unchanged; covers clean v-band faces (parts 0/2/5/6/7/8/9/…).
+2. **General polygon model (CT-TRIM-2)** — if the band model does not validate, reconstruct EVERY wire
+   (seam edges included) into a closed UV ring by **endpoint chaining** of the oriented edge polylines
+   (apply edge orientation; greedily attach the unused segment whose endpoint matches the current chain
+   end within 1e-4, reversing if needed; require the ring to close within 1e-2). Rings spanning ~the
+   full u-extent are **outer**; local rings are **holes**. `ClassifyUVTrim` (mode `Poly`): inside the
+   even-odd union of the outer rings (crossing-number) AND not inside any hole; a hit within the 0.02 mm
+   boundary band of any crossed edge → defer that hit to the exact OCCT intersector.
+
+### Changes (all dev branch `/tmp/g4cad_dev`)
+
+- **`include/G4StepSolid.hh`** — `AlgoCache::UVTrim` gained `enum Mode {Band,Poly}` + `mode` field and
+  `outU`/`outV` (outer rings for the Poly model). ABI-safe: libG4CAD owns AlgoCache (same pattern as
+  CT-TRIM). No new `G4StepSolid` non-static member.
+- **`src/G4StepSolidImpl.cc`** — refactored `BuildUVTrim` into two attempts (Band then Poly) sharing one
+  `selfValidate` lambda (FClass2d ground truth, zero-mismatch gate); added the seam-aware ring chainer;
+  extended `ClassifyUVTrim` with the `Poly` crossing-number branch (factored a shared
+  `CrossingNumberRing` helper used by band-holes and polygon rings). `IntersectFaceForParity` is
+  unchanged — it already routes any `valid` cylinder UVTrim through `ClassifyUVTrim`, so the Poly model
+  is picked up transparently. Added construction-time diagnostics (`G4CAD_UVTRIM_DEBUG`) and an A/B
+  bypass `G4CAD_UVTRIM_NOPOLY` (disables only the Poly attempt → exact CT-TRIM behaviour).
+- **`src/G4StepSolid.cc`** — timing-report + verbose-coverage labels updated to report band-vs-polygon
+  counts.
+- **ABI**: full lib rebuild+install + benchmark rebuild after every header change.
+
+### Did part_1's faces validate against FClass2d? — YES
+
+Both R=75 and R=77 seam-notched faces: the v-band attempt fails (2047/20000), the **general polygon
+attempt validates with ZERO mismatch (0/20000)**. Coverage:
+
+| part | CT-TRIM (band only) | CT-TRIM-2 (band + polygon) |
+|------|---------------------|----------------------------|
+| part_0 | 3/4 | 3/4 (3 band, 0 poly) |
+| part_1 | 3/7 | **5/7 (3 band, 2 polygon)** |
+| part_2 | 3/4 | 3/4 (3 band, 0 poly) |
+| parts 3–12 | unchanged | unchanged (no seam-notched faces) |
+
+Only part_1 changed; every other solid's validated set is bit-identical → no regression risk elsewhere.
+part_1's remaining 2 non-validated faces are its 2 Plane faces (not cylinders → out of scope).
+
+### Correctness gates — ALL PASS
+
+**5 simple geometries — navigation (0% mismatch, max_dev < 4e-12 mm) + safety (ratio_median=1, frac_lt_0.1=0):**
+
+| geom | navigation (mismatch / max_dev_in / max_dev_out) | safety |
+|------|--------------------------------------------------|--------|
+| box | 0% / 1.42e-14 / 0 | ratio_median=1, frac_lt_0.1=0 |
+| sphere | 0% / 2.27e-13 / 4.26e-14 | ratio_median=1, frac_lt_0.1=0 |
+| cylinder | 0% / 4.55e-13 / 8.53e-14 | ratio_median=1, frac_lt_0.1=0 |
+| box_hole | 0% / 3.13e-13 / 1.78e-12 | ratio_median=1, frac_lt_0.1=0 |
+| touching_boxes | 0% / 2.84e-14 / 1.14e-13 | ratio_median=1, frac_lt_0.1=0 |
+
+(Simple geoms have no seam-notched faces → 0 polygon models built; these gates confirm the existing
+paths are untouched. The polygon path is exercised + validated by RP.step part_1.)
+
+**RP.step differential (analytic Inside vs `G4CAD_INSIDE_FORCE_OCCT=1`, 200,000-point bbox cloud):
+0 / 200,000 disagreement** — NOT worse than the 1/200000 CT-TRIM baseline (well within the ≤1/200000
+gate; in=11172 analytic == 11172 OCCT this run).
+
+**RP.step physics 200 ev**: completes, no crash/assertion. PASS.
+
+### Stability verification (the prior "227-hit explosion" must NOT recur)
+
+Ran 200 ev with the recorder (`G4CAD_RECORD`):
+- **0 stuck-signature rows** (no `DistanceToOut(p,v)≈0 AND Inside(p)==kInside`).
+- 14,536 queries / 200 ev ≈ **72.7/ev** — bounded, matches the CT-TRIM baseline; no per-point explosion.
+
+Why it stays correct: every Poly model is proven equivalent to FClass2d at construction (zero-mismatch
+gate over a 2000-point random UV cloud; the diagnostic confirms 0/20000 for part_1's faces), and any
+runtime hit within the 0.02 mm boundary band defers to the exact OCCT intersector — so GroupHits/parity
+never see a spurious or missing crossing. Inside↔DistanceToIn/Out stay consistent because both call
+`IntersectFaceForParity` with identical math.
+
+### CT-TRIM-2 vs CT-TRIM comparison — RP.step (1T, G4CAD_TIMER=1, same binary A/B via `G4CAD_UVTRIM_NOPOLY`)
+
+**part_1 Inside() (the target):**
+
+| metric | CT-TRIM (NOPOLY) | CT-TRIM-2 | Δ |
+|--------|------------------|-----------|---|
+| part_1 Inside ns/call @200 ev | 215,431 | **37,106** | **-83%** |
+| part_1 Inside ns/call @1000 ev | 198,650 | **34,136** | **-83%** |
+| part_1 Inside µs-total @200 ev | 305,912 | 52,690 | -83% |
+| part_1 Inside µs-total @1000 ev | 1,460,080 | 250,901 | **-83% (saves ~1.2 s)** |
+
+part_1 @1000 ev: inside analytic (parity) 5363 / fallback (OCCT) 283; **uv-trim accept 29,586 /
+band→OCCT 64 (0.2%)** — the polygon model classifies virtually every hit analytically.
+
+**RP.step wall (median of 3):**
+
+| metric | CT-TRIM (NOPOLY) | CT-TRIM-2 | Δ |
+|--------|------------------|-----------|---|
+| wall @200 ev | ~1.53 s | ~1.32 s | **-13%** |
+| wall @1000 ev | ~4.24 s | ~3.05 s | **-28%** |
+
+(At 1000 ev the construction cost amortises and the per-event Inside win dominates, mirroring the CT-TRIM
+amortisation pattern.) After CT-TRIM-2, part_1's dominant line is no longer Inside but its
+`DistanceToIn(p)` BRepClass3d safety prefilter (~52 ms @200 ev) — a different path, out of CT-TRIM-2 scope.
+
+### Bugs hit + fixes
+
+1. **`--events 1` complex-case aborts (SIGABRT)** during gun positioning — pre-existing, unrelated to
+   CT-TRIM-2 (5+ events and `--inside-diff` with `--events 1` both work). Used ≥5 ev for diagnostics.
+2. No correctness bugs in the polygon path: the seam-aware ring chaining + crossing-number validated
+   first try (0/20000) once the seam edges were INCLUDED in the ring (vs CT-TRIM's seam-dropping band).
+
+### Outcome
+
+- part_1 Inside −83% ns/call (215k→37k); part_1 Inside total −83%; RP.step wall −13% @200 ev / −28%
+  @1000 ev. The #1 remaining RP.step cost is cracked.
+- part_1's 2 seam-notched cylinder faces VALIDATED against FClass2d (0 mismatch) and are now analytic.
+- RP.step differential 0/200000 (not worse than baseline); zero regression on the 5 simple geometries;
+  no explosion, no stuck; Inside↔DistanceToOut consistent. Correctness strictly preserved — the
+  zero-mismatch self-validation is the safety net (a face that did not validate would have silently kept
+  the OCCT path with no speedup and no regression; here it did validate, so we got the speedup too).
+
+---
+
+## End-to-End Summary (RP.step 复杂几何提速)
+
+> 续前序 P0（T0–T3, plane/cyl/sphere 解析化，简单几何 −75~90%）。本轮针对真实复杂 CAD（RP.step, 474 面 / 13 solids）。
+> **核心方法论：每一步都先测量再定优先级**——CT0、CT1、CT-TRIM 后各重测一次，瓶颈三次移动，每次据实重排，而非机械执行原计划。
+
+### 任务链（dev 分支，逐 Task commit）
+
+| Task | 模型 | 做了什么 | 关键结果 | commit |
+|---|---|---|---|---|
+| CT0 | Sonnet 4.6 | RP.step 纳入测量体系（`--skip-volume`），产基线 | 发现 Inside 占 87% wall，74% 卡在 parts 0/1/2（OCCT BRepClass3d pathology） | `7ebb63b` |
+| CT-IN | Opus 4.8 | 解析 Inside()（射线奇偶，复用 T3）+ `analyticTrimSafe` 判据 | Inside 总 −72%；规避"227-hit 爆炸"复现 | `0b1c9ec` |
+| CT1 | Sonnet 4.6 | NearestFace 面排序 + 提前 break | NearestFace fv/call 8.4→4.4，DTO(p) −89% | `fd5e1c1` |
+| CT-TRIM | Opus 4.8 | BSpline 裁剪圆柱：UV v-band 解析裁剪（FClass2d 自校验兜底） | part_2 220k→11k ns/call | `ebd41c0` |
+| CT-TRIM-2 | Opus 4.8 | 通用 seam-aware UV 多边形裁剪（攻 part_1 非 v-band 面） | part_1 215k→37k ns/call（−83%） | `f0e35c3` |
+
+### RP.step wall time（1T, --skip-volume）
+
+逐 Task @200ev wall（构造期主导，差别被压扁）：CT0 3.81 → CT-IN 1.69 → CT1 1.39 → CT-TRIM 1.34 → **CT-TRIM-2 1.33 s**。
+
+**真实提速 vs 事件数**（终态二进制同二进制 A/B，`G4CAD_INSIDE_FORCE_OCCT` 开关，优化后 vs 未优化 Inside）：
+
+| 事件数 | 优化后 | 未优化(OCCT) | 提速 |
+|---|---|---|---|
+| 200 | 1.35 s | 4.26 s | −70% |
+| 1000 | 3.06 s | 16.93 s | **−90%** |
+| 2000 | 5.10 s | 32.98 s | **−90%** |
+| 4000 | 9.30 s | 61.27 s | **−90%** |
+
+> **提速随事件数上升到 ~90% 封顶。** 模型：wall ≈ 固定构造(~1s, STEP 读取+AlgoCache 构建+UV 镶嵌, 一次性,未被优化) + 事件数 × 每事件几何成本。每事件成本 未优化 ~15 ms/ev → 优化后 ~2 ms/ev（稳态 ~7–8× 快，来自 Inside ns/call 降 10–50×）。事件少时固定构造占比大稀释百分比（−70%）；事件多时每事件主导，趋近天花板 1−2/15 ≈ −90%。生产级长跑拿到完整 ~90%。
+>
+> ⚠️ 早期本节曾误把"CT-TRIM→CT-TRIM-2 增量 −28%@1000ev(NOPOLY)"与"整链 −65%@200ev"并列，造成"事件越多提速越少"的错觉——已更正为上表的同二进制全量 A/B。
+
+### 终态 RP.step Inside 关键 solid（ns/call）
+
+| solid | 面型 | CT0 | 终态 | 说明 |
+|---|---|---|---|---|
+| part_0 | 1P+3Cyl(BSpline trim) | 590k | ~108k | 仍有少量 OCCT 兜底 hit |
+| part_1 | 2P+5Cyl(seam-notch trim) | 630k | ~37k | CT-TRIM-2 通用多边形拿下 |
+| part_2 | 1P+3Cyl(v-band trim) | 1.48M | ~11k | CT-TRIM v-band 拿下 |
+| parts 6/9/12 | 含 Torus | — | 33k–118k | Torus 无解析 → OCCT 分类器（设计内回退） |
+
+### 正确性（全程零退化）
+- 5 简单几何 navigation **0% mismatch, max_dev < 4e-12 mm**；safety ratio_median=1.0。
+- RP.step 微分 analytic-vs-OCCT **0/200000**。
+- 无 stuck-signature、无 227-hit 爆炸复现；Inside↔DistanceToOut 一致。
+
+### 剩余瓶颈与后续（明确不做的理由）
+- **含 Torus 的 solid（parts 5/6/8/9/12）Inside 回退 OCCT**（~70ms@200ev）：需解析 Torus（四次方程，数值脆弱）→ 性价比低，**不做**。
+- **CT2（face BVH）**：CT1 已把 NearestFace/RayCast 压到 ~1.5% wall，对本 474 面几何近无感；**仅对更大 CAD（面数更多、单 solid 面数更高，如 >1000 面）才显价值** → 列为后续。
+- **CT3（矩形平面 ray）/CT4（Cone）**：CT3 已被 CT-TRIM 的 UV 多边形机制吸收；CT4 仅对 part_11（唯一 Cone-无-Torus solid，Inside 仅 ~2.9ms）有效 → 价值极低，不做。
+
+### 复用资产
+CT-TRIM/CT-TRIM-2 的 UV 裁剪机制（构造期镶嵌 + FClass2d 自校验 + seam-aware crossing-number）是通用的，未来 ray 路径（DistanceToIn/Out(p,v)）的非 trim-safe 面解析化可直接复用。诊断 env（默认关）：`G4CAD_UVTRIM_OFF/_NOPOLY/_VERBOSE/_BAND`、`G4CAD_INSIDE_FORCE_OCCT`、`G4CAD_RECORD`。
+
+---

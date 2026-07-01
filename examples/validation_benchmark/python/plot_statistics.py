@@ -55,7 +55,9 @@ def main():
     plt.tight_layout()
     out = outdir / "physics_statistics.pdf"
     fig.savefig(out, bbox_inches="tight")
-    print(f"Saved {out}")
+    out_eps = outdir / "physics_statistics.eps"
+    fig.savefig(out_eps, format="eps", bbox_inches="tight")
+    print(f"Saved {out}  +  {out_eps}")
 
     # Print compact table
     cols = ["geometry", "mode", "n_events",

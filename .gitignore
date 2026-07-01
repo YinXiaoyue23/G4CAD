@@ -15,9 +15,20 @@ tools/
 # Superpowers scratch (SDD ledger, plan cache)
 .superpowers/
 
-# Benchmark test outputs and generated figures
+# Benchmark build artifacts
+examples/validation_benchmark/CMakeCache.txt
+examples/validation_benchmark/CMakeFiles/
+examples/validation_benchmark/Makefile
+examples/validation_benchmark/cmake_install.cmake
+examples/validation_benchmark/g4cad_bench
+
+# Benchmark test outputs (legacy flat output_* files and subdirectory)
+examples/validation_benchmark/output_*.csv
+examples/validation_benchmark/output_*.txt
 examples/validation_benchmark/output/
 examples/validation_benchmark/figures/
 
-# Ephemeral progress tracking
+# Ephemeral progress tracking and local planning docs
 docs/progress/
+docs/complex_geometry_optimization_plan.md
+docs/single_thread_optimization.md

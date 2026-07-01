@@ -69,8 +69,10 @@ def plot_triplet(native_path, step_path, mismatch_path, out_pdf):
     fig.suptitle(f"Cross-section: {geom_name}", fontsize=12)
     plt.tight_layout()
     fig.savefig(out_pdf, bbox_inches="tight", dpi=150)
+    out_eps = out_pdf.replace(".pdf", ".eps")
+    fig.savefig(out_eps, format="eps", bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved {out_pdf}")
+    print(f"Saved {out_pdf}  +  {out_eps}")
 
 
 def main():
