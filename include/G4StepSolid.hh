@@ -11,9 +11,11 @@
 #include <TopoDS_Face.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <IntCurvesFace_Intersector.hxx>
+#include <IntCurveSurface_TransitionOnCurve.hxx>
 #include <TopTools_DataMapOfShapeInteger.hxx>
 #include <Bnd_Box.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Ax3.hxx>
 #include <TopoDS_Face.hxx>
 
 class BRepExtrema_DistShapeShape;
@@ -71,11 +73,69 @@ private:
     G4double fXmin, fXmax, fYmin, fYmax, fZmin, fZmax;
     G4double fTolerance;
 
+    // Ray-cast hit: one surface crossing produced by a single Perform() call or analytic formula.
+    struct RayHit {
+        G4double                          w;
+        IntCurveSurface_TransitionOnCurve trans;
+        TopoDS_Face                       face;
+        G4double                          u, v;
+        RayHit(G4double w_, IntCurveSurface_TransitionOnCurve t,
+               const TopoDS_Face& f, G4double u_, G4double v_)
+            : w(w_), trans(t), face(f), u(u_), v(v_) {}
+    };
+
+    // Grouped hits within distance tolerance: one potential boundary crossing.
+    struct HitGroup {
+        G4double    dist;
+        int         nIn     = 0;
+        int         nOut    = 0;
+        TopoDS_Face outFace;
+        G4double    outU    = 0;
+        G4double    outV    = 0;
+        TopoDS_Face anyFace;
+    };
+
+    // In-place group: sorts hits and populates out. Modifies hits in place (sorts).
+    static void GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& out, G4double tol);
+
     // For GetPointOnSurface: precomputed at construction, read-only at runtime, lock-free
     struct FaceEntry {
         TopoDS_Face face;
         Bnd_Box     bbox;
         G4double u0, u1, v0, v1;
+
+        // Analytic geometry (Task 2/3): surface type + parameters extracted at construction.
+        // Only the fields relevant to surfType are populated; others are default-initialised.
+        enum class SurfType : uint8_t { Other=0, Plane=1, Cylinder=2, Sphere=3 };
+        SurfType surfType  = SurfType::Other;
+
+        // Plane  (surfType==Plane): normal = pos.Direction(), U axis = pos.XDirection(),
+        //                          V axis = pos.YDirection(), origin = pos.Location()
+        // Cylinder (surfType==Cylinder): axis dir = pos.Direction(), base = pos.Location(),
+        //                          XDir for U angle = pos.XDirection(); radius = cylR
+        // Sphere (surfType==Sphere): center = pos.Location(), radius = sphR
+        gp_Ax3   pos;           // coordinate system (shared by all three types)
+        G4double cylR = 0;      // cylinder radius (Cylinder only)
+        G4double sphR = 0;      // sphere radius   (Sphere only)
+
+        // Plane only: true if the face is trimmed by exactly 4 line edges (a rectangle).
+        // For rectangles the UV bounding box is the exact trim boundary → analytic UV check
+        // is sufficient. For other plane trims (disks, annular rings, polygons) fall back
+        // to OCCT so we don't produce hits outside the actual face boundary.
+        bool isRectPlane = false;
+
+        // CT-IN: true iff the analytic UV-rectangle [u0,u1]×[v0,v1] is the EXACT trim
+        // boundary of the face, so analytic ray-face intersection cannot produce a hit
+        // outside the real face. This is required for ray-parity Inside(): a single
+        // spurious hit flips parity. Criteria:
+        //   Plane    → isRectPlane (4 line edges).
+        //   Cylinder → full periodic in u (uspan≈2π) AND exactly 4 edges, all Line/Circle
+        //              (the 2 seam lines + 2 cap circles → UV box == trim, no cutouts).
+        //   Sphere   → same as cylinder.
+        // Faces with cutouts, curved (BSpline) trims, or partial non-rectangular trims
+        // are NOT trim-safe → ray parity routes them through the OCCT trim-exact
+        // IntCurvesFace_Intersector instead (still ~150× faster than BRepClass3d::Perform).
+        bool analyticTrimSafe = false;
     };
 
     struct NearestFaceResult {
@@ -111,6 +171,102 @@ private:
         G4double                       requestedTol = 1e-7;
         G4double                       occtTol      = 1e-7;
         bool                           perSolidTol  = true;
+
+        // --- CT-IN: analytic Inside (ray parity) per-solid data ---
+        // For each solid (index i, same order as solidClassifiers/solidBoxes):
+        //   solidFaceIdx[i] = list of indices into owner->fFaces belonging to solid i.
+        //   analyticInsideOK[i] = true iff EVERY face of solid i is an analytic-complete
+        //                         type (Plane/Cylinder/Sphere). Cone/Torus/Other → false →
+        //                         that solid falls back to BRepClass3d_SolidClassifier.
+        // Built once when the AlgoCache is constructed (owned by libG4CAD → ABI-safe).
+        std::vector<std::vector<int>>  solidFaceIdx;
+        std::vector<char>              analyticInsideOK;
+
+        // --- CT-TRIM: UV v-band trim model for full-periodic analytic cylinder faces ---
+        // The dominant remaining cost in RP.step is the per-face OCCT
+        // IntCurvesFace_Intersector used by IntersectFaceForParity for analytic
+        // cylinder faces that carry BSpline UV trim curves (parts 0/1/2,
+        // analyticTrimSafe=false). Those faces are full-periodic in u and shaped as
+        // a "v-band": for every angle u the face spans v ∈ [bot(u), top(u)], possibly
+        // minus interior hole loops. CT-TRIM precomputes that band analytically so the
+        // analytic ray-cylinder hit (u,v) can be classified by a cheap O(1) band lookup
+        // (+ O(edges) point-in-hole test) instead of the OCCT BSpline-trim intersector.
+        //
+        // Built once at construction and SELF-VALIDATED against BRepTopAdaptor_FClass2d
+        // on a dense UV grid: useUVTrim[fi] is set ONLY if the band model reproduces
+        // OCCT's in/out classification with ZERO mismatch over the grid. Any face that
+        // does not validate (partial-u, complex multi-loop trims, etc.) keeps
+        // useUVTrim=false and routes to the existing OCCT intersector — correctness
+        // outranks speed, so a non-validating face is never accelerated.
+        //
+        // Indexed by global face index (owner->fFaces). ABI-safe: libG4CAD owns AlgoCache.
+        struct UVTrim {
+            bool   valid = false;        // model validated → safe to use at runtime
+            bool   periodic = false;     // full 2π in u → wrap hit u into [u0,u1)
+            double u0 = 0, u1 = 0;       // face u-domain (full period: u1-u0 ≈ 2π)
+            double v0 = 0, v1 = 0;       // face v-domain (axial range)
+
+            // CT-TRIM-2: two model kinds. The v-band model (mode==Band) covers faces
+            // whose outer trim is a single bot(u)≤v≤top(u) envelope (parts 0/2/5/6/…).
+            // The general-polygon model (mode==Poly) covers faces whose outer trim is
+            // NOT a clean v-band — e.g. part_1's full-2π cylinder faces whose outer
+            // wire carries a seam-crossing notch (so top(u)/bot(u) is wrong near the
+            // seam). For those the outer boundary is stored as one or more closed UV
+            // rings reconstructed (seam-aware) in the [u0,u1]×v plane; classification
+            // is a crossing-number point-in-polygon-with-holes test.
+            enum class Mode : uint8_t { Band = 0, Poly = 1 };
+            Mode   mode = Mode::Band;
+
+            // --- Band model (mode==Band) ---
+            double du = 0;               // (u1-u0)/NB  (bin width)
+            int    NB = 0;               // number of u-bins
+            // top[b]/bot[b]: piecewise-linear upper/lower v-envelope sampled at bin
+            // centres u0+(b+0.5)*du. A point (u,v) is in the band iff bot ≤ v ≤ top.
+            std::vector<double> top, bot;
+            // Interior hole loops as closed UV polygons (crossing-number test). A point
+            // inside any hole is OUTSIDE the face. Holes never wrap the seam (they are
+            // local), so a plain even-odd test in (u,v) is exact for them.
+            std::vector<std::vector<double>> holeU, holeV;
+
+            // --- General polygon model (mode==Poly) ---
+            // Outer boundary rings reconstructed in the [u0,u1]×v plane (seam edges
+            // INCLUDED, so each ring is a closed polygon that respects the seam). The
+            // face interior is the even-odd union of these rings. Holes (interior loops)
+            // are stored in holeU/holeV above and subtracted. A point is in the face iff
+            // it is inside the outer rings (odd winding) AND not inside any hole.
+            std::vector<std::vector<double>> outU, outV;
+
+            // Boundary band (UV units): if a hit is within this of any polygon/envelope
+            // edge the classification is ambiguous → defer THAT hit to the OCCT
+            // intersector. For the Poly model the band is applied as a u/v distance to
+            // the nearest crossed edge.
+            double band = 0;
+        };
+        std::vector<UVTrim>            faceUVTrim;       // per global face index
+
+        // Per-solid parity ray directions, ordered fastest→slowest, chosen at
+        // construction by timing candidate directions against this solid's faces.
+        // The OCCT IntCurvesFace_Intersector used for BSpline-trimmed analytic
+        // faces is strongly direction-dependent (a bad direction can be 50–250×
+        // slower); picking good directions per solid keeps Inside in the µs range.
+        std::vector<std::vector<G4ThreeVector>> solidParityDirs;
+
+        // Scratch buffer for the Inside ray-parity hit list (reused per query, no alloc).
+        std::vector<RayHit>            scratchInsideHits;
+
+        // CT1: scratch buffer for NearestFace face-ordering pass.
+        // Holds (bbox_lower_bound_dist, face_index) pairs sorted ascending so the
+        // nearest-bbox face is processed first and the loop can break early once
+        // the bbox lower bound exceeds the current best distance.
+        std::vector<std::pair<double,int>> scratchFaceOrder;
+
+        const G4StepSolid*  owner = nullptr;
+
+        // Per-thread scratch buffers reused each RayCastToBoundary call to
+        // avoid per-query heap allocation. Capacity grows to steady-state
+        // (2 × nFaces) after the first few calls and never shrinks.
+        std::vector<RayHit>   scratchHits;
+        std::vector<HitGroup> scratchGroups;
 
         AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                   const G4StepSolid* ownerSolid);
@@ -153,6 +309,32 @@ private:
     void BuildFaceWeights();
     AlgoCache* GetAlgo() const;
     NearestFaceResult NearestFace(const gp_Pnt& pt) const;
+
+    // --- CT-IN: analytic point-in-solid via ray parity ---
+    // Append analytic ray-face hits for ONE face to `hits` along ray (p, dir).
+    // dir need not be unit length (w-parameters are along dir). Returns false if
+    // the face is not an analytic type (caller must then bail to OCCT for the solid).
+    // Mirrors the exact analytic math used by RayCastToBoundary so Inside() stays
+    // consistent with DistanceToIn/Out.
+    bool IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
+                                const G4ThreeVector& dir, G4double octTol,
+                                std::vector<RayHit>& hits) const;
+
+    // --- CT-TRIM: build + self-validate the UV v-band trim model for one face.
+    // Returns a populated UVTrim; .valid is true only if the band reproduces
+    // BRepTopAdaptor_FClass2d's classification with zero mismatch on a dense grid.
+    // Called once per face at AlgoCache construction. Only attempts full-periodic
+    // cylinder faces that are NOT analyticTrimSafe; others return .valid=false.
+    AlgoCache::UVTrim BuildUVTrim(const FaceEntry& fe, G4double octTol) const;
+    // Classify a UV hit (u,v) against a validated band model.
+    //   returns +1 = inside face, 0 = outside face, -1 = ambiguous (boundary band).
+    static int ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v);
+    // Classify p against a single analytic solid (index si) by ray parity.
+    // Returns kInside / kOutside / kSurface. `ok` is set false if the analytic
+    // method could not decide (ambiguous after perturbation retries) → caller
+    // falls back to the OCCT classifier for that solid.
+    EInside InsideSolidAnalytic(int si, const G4ThreeVector& p,
+                                AlgoCache* algo, bool& ok) const;
     G4ThreeVector GetNormalAtIntersection(const TopoDS_Face& face, G4double u, G4double v) const;
 
     // Unified ray-boundary helper used by both DistanceToIn(p,v) and DistanceToOut(p,v).

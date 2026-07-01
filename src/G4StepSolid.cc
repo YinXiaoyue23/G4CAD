@@ -28,11 +28,17 @@
 #include <GProp_GProps.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Pln.hxx>
+#include <BRepAdaptor_Curve.hxx>
+#include <GeomAbs_CurveType.hxx>
 #include <TopoDS_Face.hxx>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <map>
 #include <vector>
 
@@ -225,6 +231,74 @@ void G4StepSolid::BuildFaceWeights() {
         fe.v0 = surf.FirstVParameter();
         fe.v1 = surf.LastVParameter();
 
+        switch (st) {
+            case GeomAbs_Plane: {
+                gp_Pln pln = surf.Plane();
+                fe.surfType = FaceEntry::SurfType::Plane;
+                fe.pos      = pln.Position();
+                // Detect rectangular face: exactly 4 edges, all linear.
+                // Only rectangular faces have UV bounding box == actual trim boundary.
+                {
+                    int nEdges = 0;
+                    bool allLine = true;
+                    for (TopExp_Explorer ew(face, TopAbs_EDGE); ew.More() && allLine; ew.Next()) {
+                        BRepAdaptor_Curve c(TopoDS::Edge(ew.Current()));
+                        allLine = (c.GetType() == GeomAbs_Line);
+                        ++nEdges;
+                    }
+                    fe.isRectPlane = (allLine && nEdges == 4);
+                }
+                fe.analyticTrimSafe = fe.isRectPlane;  // CT-IN: plane trim-safe ⇔ rectangular
+                break;
+            }
+            case GeomAbs_Cylinder: {
+                gp_Cylinder cyl = surf.Cylinder();
+                fe.surfType = FaceEntry::SurfType::Cylinder;
+                fe.pos      = cyl.Position();
+                fe.cylR     = cyl.Radius();
+                // CT-IN: trim-safe iff full-periodic in u AND exactly 4 edges, all
+                // Line (seams) or Circle (caps). Cutout/partial faces (curved edges
+                // or edge count ≠ 4) over-cover the UV box → route through OCCT.
+                {
+                    bool fullU = (surf.LastUParameter() - surf.FirstUParameter()
+                                  >= 2.0*M_PI - 1e-7);
+                    int nEdges = 0;
+                    bool simpleEdges = true;
+                    for (TopExp_Explorer ew(face, TopAbs_EDGE); ew.More() && simpleEdges; ew.Next()) {
+                        BRepAdaptor_Curve c(TopoDS::Edge(ew.Current()));
+                        GeomAbs_CurveType ct = c.GetType();
+                        simpleEdges = (ct == GeomAbs_Line || ct == GeomAbs_Circle);
+                        ++nEdges;
+                    }
+                    fe.analyticTrimSafe = (fullU && simpleEdges && nEdges == 4);
+                }
+                break;
+            }
+            case GeomAbs_Sphere: {
+                gp_Sphere sph = surf.Sphere();
+                fe.surfType = FaceEntry::SurfType::Sphere;
+                fe.pos      = sph.Position();
+                fe.sphR     = sph.Radius();
+                {
+                    bool fullU = (surf.LastUParameter() - surf.FirstUParameter()
+                                  >= 2.0*M_PI - 1e-7);
+                    int nEdges = 0;
+                    bool simpleEdges = true;
+                    for (TopExp_Explorer ew(face, TopAbs_EDGE); ew.More() && simpleEdges; ew.Next()) {
+                        BRepAdaptor_Curve c(TopoDS::Edge(ew.Current()));
+                        GeomAbs_CurveType ct = c.GetType();
+                        simpleEdges = (ct == GeomAbs_Line || ct == GeomAbs_Circle);
+                        ++nEdges;
+                    }
+                    fe.analyticTrimSafe = (fullU && simpleEdges && nEdges == 4);
+                }
+                break;
+            }
+            default:
+                fe.surfType = FaceEntry::SurfType::Other;
+                break;
+        }
+
         fFaces.push_back(fe);
 
         cumArea += area;
@@ -262,6 +336,23 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
     const gp_Pnt pt = G4toOCCT(p);
     for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
         if (algo->solidBoxes[i].IsOut(pt)) continue;
+
+        // CT-IN: analytic point-in-solid via ray parity for solids whose faces are
+        // ALL analytic-complete types (Plane/Cylinder/Sphere). Solids with Cone or
+        // Torus faces fall back to BRepClass3d_SolidClassifier::Perform unchanged.
+        // This replaces the per-call OCCT classifier (594k–1.5M ns/call pathology
+        // on RP.step parts 0/1/2) with a sub-µs analytic ray cast.
+        if (algo->analyticInsideOK[i]) {
+            bool ok = true;
+            EInside ai = InsideSolidAnalytic((int)i, p, algo, ok);
+            if (ok) {
+                if (ai == kInside) { result = kInside; break; }
+                if (ai == kSurface) result = kSurface;
+                continue;
+            }
+            // Ambiguous (degenerate ray after perturbations) → fall through to OCCT.
+        }
+
         algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
         auto s = algo->solidClassifiers[i]->State();
         if (s == TopAbs_IN) { result = kInside; break; }

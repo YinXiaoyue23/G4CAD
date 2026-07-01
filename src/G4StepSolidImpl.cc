@@ -14,9 +14,20 @@
 #include <gp_Dir.hxx>
 #include <gp_Lin.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pnt2d.hxx>
 #include <gp_Vec.hxx>
+// CT-TRIM: UV trim discretisation + ground-truth 2D classifier for self-validation
+#include <BRepTools_WireExplorer.hxx>
+#include <BRepAdaptor_Curve2d.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
+#include <GeomAbs_SurfaceType.hxx>
+#include <TopoDS_Wire.hxx>
+#include <TopoDS_Edge.hxx>
+#include <random>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -26,66 +37,6 @@ namespace {
     // for three trivial one-liners.
     inline gp_Pnt        G4toOCCT(const G4ThreeVector& v) { return gp_Pnt(v.x(), v.y(), v.z()); }
     inline G4ThreeVector OCCTtoG4(const gp_Dir& d)        { return G4ThreeVector(d.X(), d.Y(), d.Z()); }
-
-    // Ray-casting primitives
-    struct RayHit {
-        G4double                          w;
-        IntCurveSurface_TransitionOnCurve trans;
-        TopoDS_Face                       face;
-        G4double                          u, v;
-        RayHit(G4double w_, IntCurveSurface_TransitionOnCurve t,
-               const TopoDS_Face& f, G4double u_, G4double v_)
-            : w(w_), trans(t), face(f), u(u_), v(v_) {}
-    };
-
-    struct HitGroup {
-        G4double    dist;
-        int         nIn     = 0;
-        int         nOut    = 0;
-        TopoDS_Face outFace;
-        G4double    outU    = 0;
-        G4double    outV    = 0;
-        TopoDS_Face anyFace;
-    };
-
-    // Takes hits by value so we can sort in place.
-    std::vector<HitGroup> GroupHits(std::vector<RayHit> hits, G4double tol) {
-        if (hits.empty()) return {};
-        std::sort(hits.begin(), hits.end(),
-                  [](const RayHit& a, const RayHit& b){ return a.w < b.w; });
-
-        std::vector<HitGroup> groups;
-        for (const RayHit& h : hits) {
-            if (h.trans == IntCurveSurface_Tangent) continue;
-            if (!groups.empty() && h.w - groups.back().dist < tol) {
-                if (h.trans == IntCurveSurface_In) {
-                    groups.back().nIn++;
-                } else {
-                    groups.back().nOut++;
-                    if (groups.back().outFace.IsNull()) {
-                        groups.back().outFace = h.face;
-                        groups.back().outU    = h.u;
-                        groups.back().outV    = h.v;
-                    }
-                }
-                if (groups.back().anyFace.IsNull()) groups.back().anyFace = h.face;
-            } else {
-                HitGroup g;
-                g.dist    = h.w;
-                g.anyFace = h.face;
-                if (h.trans == IntCurveSurface_In) {
-                    g.nIn = 1;
-                } else {
-                    g.nOut    = 1;
-                    g.outFace = h.face;
-                    g.outU    = h.u;
-                    g.outV    = h.v;
-                }
-                groups.push_back(g);
-            }
-        }
-        return groups;
-    }
 
     // Minimum possible distance from point to AABB; 0 if inside.
     inline G4double BBoxPointDist(const Bnd_Box& box, const gp_Pnt& p) {
@@ -136,6 +87,46 @@ namespace {
 } // namespace
 
 // ====================================================================
+// GroupHits — in-place sort + group (modifies hits vector)
+// ====================================================================
+void G4StepSolid::GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& out, G4double tol) {
+    out.clear();
+    if (hits.empty()) return;
+    std::sort(hits.begin(), hits.end(),
+              [](const RayHit& a, const RayHit& b){ return a.w < b.w; });
+
+    for (const RayHit& h : hits) {
+        if (h.trans == IntCurveSurface_Tangent) continue;
+        if (!out.empty() && h.w - out.back().dist < tol) {
+            if (h.trans == IntCurveSurface_In) {
+                out.back().nIn++;
+            } else {
+                out.back().nOut++;
+                if (out.back().outFace.IsNull()) {
+                    out.back().outFace = h.face;
+                    out.back().outU    = h.u;
+                    out.back().outV    = h.v;
+                }
+            }
+            if (out.back().anyFace.IsNull()) out.back().anyFace = h.face;
+        } else {
+            HitGroup g;
+            g.dist    = h.w;
+            g.anyFace = h.face;
+            if (h.trans == IntCurveSurface_In) {
+                g.nIn = 1;
+            } else {
+                g.nOut    = 1;
+                g.outFace = h.face;
+                g.outU    = h.u;
+                g.outV    = h.v;
+            }
+            out.push_back(g);
+        }
+    }
+}
+
+// ====================================================================
 // AlgoCache
 // ====================================================================
 int G4StepSolid::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
@@ -145,6 +136,7 @@ int G4StepSolid::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
 
 G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                                    const G4StepSolid* ownerSolid)
+    : owner(ownerSolid)
 {
     requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
 
@@ -175,6 +167,109 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
         auto* dss = new BRepExtrema_DistShapeShape();
         dss->LoadS2(fe.face);
         faceExtrema.push_back(dss);
+    }
+
+    const size_t nFaces = ownerSolid->fFaces.size();
+    scratchHits.reserve(2 * nFaces);
+    scratchGroups.reserve(nFaces);
+    scratchInsideHits.reserve(2 * nFaces);
+    scratchFaceOrder.reserve(nFaces);  // CT1: one entry per face
+
+    // --- CT-IN: build per-solid face index lists + analytic-Inside coverage flags ---
+    // solidClassifiers has one entry per TopAbs_SOLID (built above, same `si` order).
+    // For each face in fFaces, look up its owning solid via faceSolidMap and bucket it.
+    const size_t nSolids = solidClassifiers.size();
+    solidFaceIdx.assign(nSolids, {});
+    analyticInsideOK.assign(nSolids, 1);  // start true; cleared by any non-analytic face
+    for (int fi = 0; fi < (int)ownerSolid->fFaces.size(); ++fi) {
+        const TopoDS_Face& f = ownerSolid->fFaces[fi].face;
+        int si = FaceToSolid(f);
+        if (si < 0 || si >= (int)nSolids) {
+            // Unmapped face (should not happen): be conservative — no analytic Inside.
+            for (auto& flag : analyticInsideOK) flag = 0;
+            continue;
+        }
+        solidFaceIdx[si].push_back(fi);
+        const auto st = ownerSolid->fFaces[fi].surfType;
+        if (st != G4StepSolid::FaceEntry::SurfType::Plane &&
+            st != G4StepSolid::FaceEntry::SurfType::Cylinder &&
+            st != G4StepSolid::FaceEntry::SurfType::Sphere) {
+            analyticInsideOK[si] = 0;  // Cone/Torus/Other → OCCT fallback for this solid
+        }
+    }
+    // A solid with zero registered faces (degenerate) must not use analytic Inside.
+    for (size_t i = 0; i < nSolids; ++i)
+        if (solidFaceIdx[i].empty()) analyticInsideOK[i] = 0;
+
+    // --- CT-TRIM / CT-TRIM-2: build + self-validate the UV trim model per face ---
+    // BuildUVTrim tries a v-band model (CT-TRIM) and, for faces that are not a clean
+    // v-band (part_1's seam-notched full-2π cylinders), a general seam-aware polygon
+    // model (CT-TRIM-2). A model becomes .valid only on ZERO mismatch vs FClass2d;
+    // others keep .valid=false and the OCCT intersector path (no regression). Build is
+    // offline (per-thread, once) so its FClass2d cost is irrelevant to runtime navigation.
+    {
+        const int nF = (int)ownerSolid->fFaces.size();
+        faceUVTrim.resize(nF);
+        for (int fi = 0; fi < nF; ++fi)
+            faceUVTrim[fi] = ownerSolid->BuildUVTrim(ownerSolid->fFaces[fi], occtTol);
+    }
+
+    // --- CT-IN: per-solid parity-direction selection ---
+    // For each analytic solid, time a fixed set of candidate ray directions against
+    // its faces (using the prebuilt OCCT intersectors that the non-trim-safe faces
+    // will actually use) and keep the 4 fastest, fastest first. This sidesteps the
+    // OCCT IntCurvesFace_Intersector direction pathology on BSpline-trimmed cylinders.
+    // The candidate set is deterministic; the probe origins are deterministic too.
+    {
+        solidParityDirs.assign(nSolids, {});
+        // 14 well-spread unit directions (axis-ish + diagonals). Deterministic.
+        static const double cand[][3] = {
+            {0.9789,0.1449,0.1449},{0.1449,0.9789,0.1449},{0.1449,0.1449,0.9789},
+            {0.8018,0.5345,0.2673},{0.2673,0.8018,0.5345},{0.5345,0.2673,0.8018},
+            {0.5774,0.5774,0.5774},{-0.5774,0.5774,0.5774},{0.5774,-0.5774,0.5774},
+            {0.5774,0.5774,-0.5774},{0.3015,-0.9045,0.3015},{-0.4264,0.6396,0.6396},
+            {0.6963,0.6963,0.1741},{0.1741,0.6963,0.6963}
+        };
+        const int NC = (int)(sizeof(cand)/sizeof(cand[0]));
+        for (size_t i = 0; i < nSolids; ++i) {
+            if (!analyticInsideOK[i]) continue;
+            // Solid bbox centroid + a few interior-ish probe origins.
+            Bnd_Box b; { for (int fi : solidFaceIdx[i]) b.Add(ownerSolid->fFaces[fi].bbox); }
+            if (b.IsVoid()) continue;
+            double x0,y0,z0,x1,y1,z1; b.Get(x0,y0,z0,x1,y1,z1);
+            gp_Pnt probes[3] = {
+                gp_Pnt(0.5*(x0+x1), 0.5*(y0+y1), 0.5*(z0+z1)),
+                gp_Pnt(0.5*(x0+x1)+0.13*(x1-x0), 0.5*(y0+y1)-0.11*(y1-y0), 0.5*(z0+z1)+0.07*(z1-z0)),
+                gp_Pnt(0.5*(x0+x1)-0.09*(x1-x0), 0.5*(y0+y1)+0.15*(y1-y0), 0.5*(z0+z1)-0.12*(z1-z0))
+            };
+            std::vector<std::pair<double,int>> cost(NC);  // (time, candIdx)
+            for (int c = 0; c < NC; ++c) {
+                double L = std::sqrt(cand[c][0]*cand[c][0]+cand[c][1]*cand[c][1]+cand[c][2]*cand[c][2]);
+                gp_Dir gd(cand[c][0]/L, cand[c][1]/L, cand[c][2]/L);
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (const gp_Pnt& pr : probes) {
+                    gp_Lin ray(pr, gd);
+                    for (int fi : solidFaceIdx[i]) {
+                        // Only non-trim-safe faces incur the OCCT intersector cost.
+                        if (!ownerSolid->fFaces[fi].analyticTrimSafe)
+                            faceIntersectors[fi]->Perform(ray, -occtTol, kInfinity);
+                    }
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                cost[c] = { (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count(), c };
+            }
+            std::sort(cost.begin(), cost.end());
+            int keep = std::min(4, NC);
+            solidParityDirs[i].reserve(keep);
+            for (int k = 0; k < keep; ++k) {
+                const double* d = cand[cost[k].second];
+                double L = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+                solidParityDirs[i].emplace_back(d[0]/L, d[1]/L, d[2]/L);
+            }
+            if (std::getenv("G4CAD_PARITY_DIRSEL"))
+                G4cout << "[DIRSEL] solid#" << i << " best cand=" << cost[0].second
+                       << " t=" << cost[0].first << "ns  worst t=" << cost.back().first << "ns" << G4endl;
+        }
     }
 
     static std::once_flag tolPrintFlag;
@@ -222,26 +317,133 @@ G4ThreeVector G4StepSolid::GetNormalAtIntersection(const TopoDS_Face& face,
 }
 
 // ====================================================================
-// NearestFace
+// NearestFace  —  analytic fast-path for Plane/Cylinder/Sphere
 // ====================================================================
 G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const {
     NearestFaceResult result;
     if (fFaces.empty()) return result;
 
-    const TopoDS_Shape vtxShape = BRepBuilderAPI_MakeVertex(pt).Shape();
-
     AlgoCache* algo = GetAlgo();
-    for (int i = 0; i < (int)fFaces.size(); ++i) {
-        if (BBoxPointDist(fFaces[i].bbox, pt) >= result.dist) continue;
-        BRepExtrema_DistShapeShape& extrema = *algo->faceExtrema[i];
-        extrema.LoadS1(vtxShape);
-        extrema.Perform();
-        if (!extrema.IsDone()) continue;
-        G4double d = extrema.Value();
+    const G4double eps = algo->occtTol;
+
+    // OCCT fallback vertex shape — only constructed if at least one face
+    // actually needs it (lazy, avoids MakeVertex when all faces are analytic).
+    bool vtxBuilt = false;
+    TopoDS_Shape vtxShape;
+    auto getVtx = [&]() -> const TopoDS_Shape& {
+        if (!vtxBuilt) { vtxShape = BRepBuilderAPI_MakeVertex(pt).Shape(); vtxBuilt = true; }
+        return vtxShape;
+    };
+
+    // Inline dot-product helpers (avoids gp_Vec temporaries)
+    auto dot3 = [](double ax, double ay, double az,
+                   double bx, double by, double bz) {
+        return ax*bx + ay*by + az*bz;
+    };
+
+    // CT1: sort face indices by bbox lower-bound distance (ascending) so the
+    // nearest-bbox faces are processed first, making the existing prune effective.
+    // Once the bbox lower bound >= current best, all remaining faces are farther → break.
+    // Use the AlgoCache scratch buffer to avoid per-query heap allocation.
+    auto& faceOrder = algo->scratchFaceOrder;
+    faceOrder.clear();
+    const int nf = (int)fFaces.size();
+    for (int i = 0; i < nf; ++i)
+        faceOrder.emplace_back(BBoxPointDist(fFaces[i].bbox, pt), i);
+    std::sort(faceOrder.begin(), faceOrder.end());  // ascending by bbox dist
+
+    for (const auto& [bboxDist, i] : faceOrder) {
+        if (bboxDist >= result.dist) break;          // sorted → all remaining are farther
+
+        const FaceEntry& fe = fFaces[i];
+        G4double d = kInfinity;
+        gp_Pnt   foot;
+        bool     analytic = false;
+
+        if (fe.surfType == FaceEntry::SurfType::Plane) {
+            const gp_Pnt& loc = fe.pos.Location();
+            // Direction() is the plane normal (Z axis of gp_Ax3)
+            const gp_Dir& n   = fe.pos.Direction();
+            double dpx = pt.X()-loc.X(), dpy = pt.Y()-loc.Y(), dpz = pt.Z()-loc.Z();
+            double dn   = dot3(n.X(),n.Y(),n.Z(), dpx,dpy,dpz);
+            // UV coords of foot in plane parametric space
+            const gp_Dir& xu = fe.pos.XDirection();
+            const gp_Dir& yv = fe.pos.YDirection();
+            double uf = dot3(xu.X(),xu.Y(),xu.Z(), dpx,dpy,dpz);
+            double vf = dot3(yv.X(),yv.Y(),yv.Z(), dpx,dpy,dpz);
+            if (uf >= fe.u0 - eps && uf <= fe.u1 + eps &&
+                vf >= fe.v0 - eps && vf <= fe.v1 + eps) {
+                d    = std::abs(dn);
+                foot = gp_Pnt(pt.X() - dn*n.X(),
+                              pt.Y() - dn*n.Y(),
+                              pt.Z() - dn*n.Z());
+                analytic = true;
+            }
+
+        } else if (fe.surfType == FaceEntry::SurfType::Cylinder) {
+            const gp_Pnt& loc   = fe.pos.Location();
+            const gp_Dir& axDir = fe.pos.Direction();  // cylinder axis
+            double dpx = pt.X()-loc.X(), dpy = pt.Y()-loc.Y(), dpz = pt.Z()-loc.Z();
+            // Axial (V) parameter
+            double vf = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
+            if (vf >= fe.v0 - eps && vf <= fe.v1 + eps) {
+                // Radial component (perp to axis)
+                double px = dpx - vf*axDir.X();
+                double py = dpy - vf*axDir.Y();
+                double pz = dpz - vf*axDir.Z();
+                double r  = std::sqrt(px*px + py*py + pz*pz);
+                // Angular check — skip for full cylinder (u1-u0 ≈ 2π)
+                bool angOK = (fe.u1 - fe.u0 >= 2.0*M_PI - eps);
+                if (!angOK && r > eps) {
+                    // Compute angle in cylinder's local XY frame
+                    const gp_Dir& xu = fe.pos.XDirection();
+                    const gp_Dir& yv = fe.pos.YDirection();
+                    double uf = std::atan2(dot3(yv.X(),yv.Y(),yv.Z(), px,py,pz),
+                                           dot3(xu.X(),xu.Y(),xu.Z(), px,py,pz));
+                    if (uf < fe.u0 - eps) uf += 2.0*M_PI;
+                    angOK = (uf >= fe.u0 - eps && uf <= fe.u1 + eps);
+                }
+                if (angOK && r > 1e-15) {
+                    d = std::abs(r - fe.cylR);
+                    double scale = fe.cylR / r;
+                    foot = gp_Pnt(loc.X() + vf*axDir.X() + px*scale,
+                                  loc.Y() + vf*axDir.Y() + py*scale,
+                                  loc.Z() + vf*axDir.Z() + pz*scale);
+                    analytic = true;
+                }
+            }
+
+        } else if (fe.surfType == FaceEntry::SurfType::Sphere) {
+            const gp_Pnt& cen = fe.pos.Location();
+            double dpx = pt.X()-cen.X(), dpy = pt.Y()-cen.Y(), dpz = pt.Z()-cen.Z();
+            double r = std::sqrt(dpx*dpx + dpy*dpy + dpz*dpz);
+            // Full sphere check (u span ≥ 2π, v span ≥ π)
+            bool fullSphere = (fe.u1 - fe.u0 >= 2.0*M_PI - eps &&
+                               fe.v1 - fe.v0 >= M_PI - eps);
+            if (fullSphere && r > 1e-15) {
+                d = std::abs(r - fe.sphR);
+                double scale = fe.sphR / r;
+                foot = gp_Pnt(cen.X() + dpx*scale,
+                              cen.Y() + dpy*scale,
+                              cen.Z() + dpz*scale);
+                analytic = true;
+            }
+        }
+
+        if (!analytic) {
+            // OCCT fallback
+            BRepExtrema_DistShapeShape& extrema = *algo->faceExtrema[i];
+            extrema.LoadS1(getVtx());
+            extrema.Perform();
+            if (!extrema.IsDone()) continue;
+            d    = extrema.Value();
+            foot = extrema.PointOnShape2(1);
+        }
+
         if (d < result.dist) {
             result.dist    = d;
             result.idx     = i;
-            result.pOnFace = extrema.PointOnShape2(1);
+            result.pOnFace = foot;
         }
     }
     return result;
@@ -264,16 +466,184 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
     const gp_Vec invDir(1.0/v.x(), 1.0/v.y(), 1.0/v.z());
 
-    std::vector<RayHit> rawHits;
+    std::vector<RayHit>& rawHits = algo->scratchHits;
+    rawHits.clear();
+
+    // Inline dot helper
+    auto dot3 = [](double ax_, double ay_, double az_,
+                   double bx_, double by_, double bz_) {
+        return ax_*bx_ + ay_*by_ + az_*bz_;
+    };
+
     for (int fi = 0; fi < (int)fFaces.size(); ++fi) {
         const FaceEntry& fe = fFaces[fi];
         if (!rayHitsBox(ray.Location(), invDir, fe.bbox, octTol)) continue;
 
-        IntCurvesFace_Intersector& inter = *algo->faceIntersectors[fi];
-        inter.Perform(ray, -octTol, kInfinity);
-        for (int j = 1; j <= inter.NbPnt(); ++j) {
-            rawHits.emplace_back(inter.WParameter(j), inter.Transition(j),
-                                 fe.face, inter.UParameter(j), inter.VParameter(j));
+        bool analytic = false;
+
+        // ─── Plane (rectangular only; circle/annulus trim falls back to OCCT) ──
+        if (fe.surfType == FaceEntry::SurfType::Plane && fe.isRectPlane) {
+            const gp_Ax3& ax  = fe.pos;
+            const gp_Dir& nm  = ax.Direction();
+            const gp_Pnt& loc = ax.Location();
+            double nv = dot3(nm.X(),nm.Y(),nm.Z(), v.x(),v.y(),v.z());
+            if (std::abs(nv) >= 1e-15) {
+                double np = dot3(nm.X(),nm.Y(),nm.Z(),
+                                 p.x()-loc.X(), p.y()-loc.Y(), p.z()-loc.Z());
+                double t = -np / nv;
+                if (t >= -octTol) {
+                    double hx = p.x()+t*v.x()-loc.X();
+                    double hy = p.y()+t*v.y()-loc.Y();
+                    double hz = p.z()+t*v.z()-loc.Z();
+                    const gp_Dir& xu = ax.XDirection();
+                    const gp_Dir& yv = ax.YDirection();
+                    double uf = dot3(xu.X(),xu.Y(),xu.Z(), hx,hy,hz);
+                    double vf = dot3(yv.X(),yv.Y(),yv.Z(), hx,hy,hz);
+                    if (uf >= fe.u0-octTol && uf <= fe.u1+octTol &&
+                        vf >= fe.v0-octTol && vf <= fe.v1+octTol) {
+                        bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+                        double n_out_v = fwd ? nv : -nv;
+                        IntCurveSurface_TransitionOnCurve trans;
+                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                        else                        trans = IntCurveSurface_Tangent;
+                        rawHits.emplace_back(t, trans, fe.face, uf, vf);
+                    }
+                }
+            }
+            analytic = true;
+
+        // ─── Cylinder ────────────────────────────────────────────────────
+        } else if (fe.surfType == FaceEntry::SurfType::Cylinder) {
+            const gp_Ax3& ax    = fe.pos;
+            const gp_Dir& axDir = ax.Direction();
+            const gp_Pnt& axLoc = ax.Location();
+            const double   R    = fe.cylR;
+
+            double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
+            double da = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
+            double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), v.x(),v.y(),v.z());
+            double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
+            double vpx = v.x()-va_*axDir.X(), vpy = v.y()-va_*axDir.Y(), vpz = v.z()-va_*axDir.Z();
+
+            double A = vpx*vpx + vpy*vpy + vpz*vpz;
+            if (A >= 1e-30) {
+                double B    = ppx*vpx + ppy*vpy + ppz*vpz;
+                double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
+                double disc = B*B - A*C;
+
+                if (disc >= 0) {
+                    double sqrtD  = std::sqrt(std::max(disc, 0.0));
+                    bool   tang   = (sqrtD < octTol * std::sqrt(A));
+                    bool   fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
+                    bool   fwd    = (fe.face.Orientation() != TopAbs_REVERSED);
+
+                    auto tryRoot = [&](double t) {
+                        if (t < -octTol) return;
+                        double v_ax = da + t * va_;
+                        if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
+                        double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
+                        double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                        if (r < 1e-15) return;
+                        // Always compute uf (needed for correct normal in calcNorm path)
+                        const gp_Dir& xu_c = ax.XDirection();
+                        const gp_Dir& yv_c = ax.YDirection();
+                        double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
+                                               dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
+                        // Normalize to [u0, u0+2π]
+                        if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
+                        if (!fullAng && (uf < fe.u0 - octTol || uf > fe.u1 + octTol)) return;
+                        IntCurveSurface_TransitionOnCurve trans;
+                        if (tang) {
+                            trans = IntCurveSurface_Tangent;
+                        } else {
+                            double n_dot_v = dot3(qx,qy,qz, v.x(),v.y(),v.z()) / r;
+                            double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                            if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                            else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                            else                        trans = IntCurveSurface_Tangent;
+                        }
+                        rawHits.emplace_back(t, trans, fe.face, uf, v_ax);
+                    };
+
+                    if (tang) {
+                        tryRoot(-B / A);
+                    } else {
+                        tryRoot((-B - sqrtD) / A);
+                        tryRoot((-B + sqrtD) / A);
+                    }
+                }
+            }
+            analytic = true;
+
+        // ─── Sphere ──────────────────────────────────────────────────────
+        } else if (fe.surfType == FaceEntry::SurfType::Sphere) {
+            const gp_Pnt& cen = fe.pos.Location();
+            const double   R  = fe.sphR;
+
+            double dpx = p.x()-cen.X(), dpy = p.y()-cen.Y(), dpz = p.z()-cen.Z();
+            double A    = v.x()*v.x() + v.y()*v.y() + v.z()*v.z();  // ≈ 1 for unit v
+            double B    = dpx*v.x() + dpy*v.y() + dpz*v.z();
+            double C    = dpx*dpx + dpy*dpy + dpz*dpz - R*R;
+            double disc = B*B - A*C;
+
+            if (disc >= 0) {
+                double sqrtD     = std::sqrt(std::max(disc, 0.0));
+                bool   tang      = (sqrtD < octTol * std::sqrt(A));
+                bool   fullSph   = (fe.u1-fe.u0 >= 2.0*M_PI-octTol &&
+                                    fe.v1-fe.v0 >= M_PI-octTol);
+                bool   fwd       = (fe.face.Orientation() != TopAbs_REVERSED);
+
+                auto tryRoot = [&](double t) {
+                    if (t < -octTol) return;
+                    double qx = dpx+t*v.x(), qy = dpy+t*v.y(), qz = dpz+t*v.z();
+                    double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                    if (r < 1e-15) return;
+                    double uf = 0.0, vf = 0.0;
+                    if (!fullSph) {
+                        const gp_Dir& xu   = fe.pos.XDirection();
+                        const gp_Dir& yv_  = fe.pos.YDirection();
+                        const gp_Dir& zv_  = fe.pos.Direction();
+                        double xl = dot3(xu.X(),xu.Y(),xu.Z(), qx,qy,qz);
+                        double yl = dot3(yv_.X(),yv_.Y(),yv_.Z(), qx,qy,qz);
+                        double zl = dot3(zv_.X(),zv_.Y(),zv_.Z(), qx,qy,qz);
+                        uf = std::atan2(yl, xl);
+                        vf = std::asin(std::max(-1.0, std::min(1.0, zl/r)));
+                        if (uf < fe.u0 - octTol) uf += 2.0*M_PI;
+                        if (uf < fe.u0 - octTol || uf > fe.u1 + octTol) return;
+                        if (vf < fe.v0 - octTol || vf > fe.v1 + octTol) return;
+                    }
+                    IntCurveSurface_TransitionOnCurve trans;
+                    if (tang) {
+                        trans = IntCurveSurface_Tangent;
+                    } else {
+                        double n_dot_v = dot3(qx,qy,qz, v.x(),v.y(),v.z()) / r;
+                        double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                        else                        trans = IntCurveSurface_Tangent;
+                    }
+                    rawHits.emplace_back(t, trans, fe.face, uf, vf);
+                };
+
+                if (tang) {
+                    tryRoot(-B / A);
+                } else {
+                    tryRoot((-B - sqrtD) / A);
+                    tryRoot((-B + sqrtD) / A);
+                }
+            }
+            analytic = true;
+        }
+
+        // ─── OCCT fallback for Other surface types ────────────────────────
+        if (!analytic) {
+            IntCurvesFace_Intersector& inter = *algo->faceIntersectors[fi];
+            inter.Perform(ray, -octTol, kInfinity);
+            for (int j = 1; j <= inter.NbPnt(); ++j) {
+                rawHits.emplace_back(inter.WParameter(j), inter.Transition(j),
+                                     fe.face, inter.UParameter(j), inter.VParameter(j));
+            }
         }
     }
 
@@ -303,7 +673,8 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         return net > 0;
     };
 
-    for (const auto& g : GroupHits(std::move(rawHits), octTol)) {
+    GroupHits(rawHits, algo->scratchGroups, octTol);
+    for (const auto& g : algo->scratchGroups) {
         if (!isBoundaryGroup(g)) continue;
 
         const G4double band = bandOf(g);
@@ -352,4 +723,704 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut][local]"
                << " no real boundary -> bbox=" << t << G4endl;
     return (t > 0.0 && std::isfinite(t)) ? t : 0.0;
+}
+
+// ====================================================================
+// CT-TRIM: UV v-band trim model (build + classify)
+// ====================================================================
+//
+// ---- Crossing-number point-in-ring test (a horizontal ray in +u at fixed v).
+// Counts ring edges the ray crosses; XORs winding. Sets nearEdge if the query is
+// within `band` (in u, at the crossing v) of a crossed edge → ambiguous.
+// The ring vertices are a closed polyline in the (u,v) plane.
+static inline int CrossingNumberRing(const std::vector<double>& ru,
+                                     const std::vector<double>& rv,
+                                     double uu, double v, double band,
+                                     bool& nearEdge) {
+    const size_t n = ru.size();
+    int wind = 0;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        double ui = ru[i], vi = rv[i], uj = ru[j], vj = rv[j];
+        if ((vi > v) != (vj > v)) {
+            double ut = uj + (v - vj) / (vi - vj) * (ui - uj);
+            if (uu < ut) wind ^= 1;
+            if (std::abs(uu - ut) < band) nearEdge = true;
+        }
+    }
+    return wind;
+}
+
+// ClassifyUVTrim — classify a UV hit (u,v) against a validated trim model.
+//   +1 inside face, 0 outside face, -1 ambiguous (within boundary band → use OCCT).
+// u is expected in the face period; it is wrapped into [u0,u1) for full-periodic faces.
+//   Mode::Band  → bot(u) ≤ v ≤ top(u) minus holes (the original CT-TRIM model).
+//   Mode::Poly  → seam-aware crossing-number: inside the even-odd union of the outer
+//                 rings AND not inside any hole. Used for faces (part_1's full-2π
+//                 cylinders) whose outer trim carries a seam-crossing notch so a v-band
+//                 envelope is wrong near the seam.
+int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) {
+    if (!t.valid) return -1;
+    double uu = u;
+    if (t.periodic) {
+        // Wrap the (atan2-derived) hit angle into the face's u-domain [u0,u1).
+        const double period = 2.0 * M_PI;
+        while (uu <  t.u0)        uu += period;
+        while (uu >= t.u0+period) uu -= period;
+    } else {
+        // Partial-u face: a hit outside [u0,u1] is off the face. atan2 may return the
+        // hit shifted by ±2π; bring it near the domain before the range check.
+        while (uu < t.u0 - M_PI) uu += 2.0*M_PI;
+        while (uu > t.u1 + M_PI) uu -= 2.0*M_PI;
+        if (uu < t.u0 - t.band || uu > t.u1 + t.band) return 0;  // off the face in u
+        if (uu < t.u0 + t.band || uu > t.u1 - t.band) return -1; // near u-edge → defer
+    }
+
+    if (t.mode == AlgoCache::UVTrim::Mode::Poly) {
+        // v outside the axial extent (with margin) → definitely off the face.
+        if (v < t.v0 - t.band || v > t.v1 + t.band) return 0;
+        // For a full-periodic Poly face the outer rings are closed in [u0,u1]×v (seam
+        // edges included). A horizontal +u ray at fixed v from uu would, for a periodic
+        // ring, need to wrap; instead we test uu directly against rings that already
+        // include the seam segments at u0/u1, so the ray stays within [u0,u1].
+        bool nearEdge = false;
+        int inOuter = 0;
+        for (size_t r = 0; r < t.outU.size(); ++r)
+            inOuter ^= CrossingNumberRing(t.outU[r], t.outV[r], uu, v, t.band, nearEdge);
+        if (nearEdge) return -1;        // near the outer boundary → defer to OCCT
+        if (!inOuter) return 0;         // outside the outer rings → off the face
+        for (size_t h = 0; h < t.holeU.size(); ++h) {
+            bool he = false;
+            int wind = CrossingNumberRing(t.holeU[h], t.holeV[h], uu, v, t.band, he);
+            if (he)   return -1;        // near a hole boundary → defer
+            if (wind) return 0;         // inside a hole → off the face
+        }
+        return 1;                       // inside outer, outside all holes → in face
+    }
+
+    // --- Band model ---
+    int b = (int)((uu - t.u0) / t.du);
+    if (b < 0) b = 0;
+    if (b >= t.NB) b = t.NB - 1;
+    const double top = t.top[b];
+    const double bot = t.bot[b];
+    // Outside the v-band (with band margin) → clearly outside / clearly inside edge.
+    if (v < bot - t.band || v > top + t.band) return 0;
+    if (v < bot + t.band || v > top - t.band) return -1;  // near top/bot envelope → defer
+    // Inside the band core → check holes. A hit inside a hole loop is OUTSIDE the face.
+    for (size_t h = 0; h < t.holeU.size(); ++h) {
+        bool nearEdge = false;
+        int wind = CrossingNumberRing(t.holeU[h], t.holeV[h], uu, v, t.band, nearEdge);
+        if (nearEdge) return -1;       // near a hole boundary → defer to OCCT
+        if (wind)     return 0;        // inside a hole → outside the face
+    }
+    return 1;                          // inside the band, outside all holes → in face
+}
+
+// BuildUVTrim — discretise a full-periodic analytic cylinder face's real trim into a
+// v-band model (top(u)/bot(u) envelopes + interior hole loops), then SELF-VALIDATE it
+// against BRepTopAdaptor_FClass2d on a dense UV grid. .valid is set true only when the
+// band reproduces OCCT's in/out classification with ZERO mismatch. Conservative by
+// design: any face that does not validate keeps .valid=false and is never accelerated.
+G4StepSolid::AlgoCache::UVTrim
+G4StepSolid::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
+    AlgoCache::UVTrim t;
+    // Only cylinder faces with a non-trivial (non-trim-safe) trim qualify.
+    if (fe.surfType != FaceEntry::SurfType::Cylinder) return t;
+    if (fe.analyticTrimSafe) return t;   // trim-safe faces already take the fast path
+    const double u0 = fe.u0, u1 = fe.u1, v0 = fe.v0, v1 = fe.v1;
+    const bool fullU = (u1 - u0 >= 2.0*M_PI - 1e-7);
+    if (v1 <= v0 || u1 <= u0) return t;
+    const double uspan = u1 - u0;
+    const TopoDS_Face& face = fe.face;
+
+    // Runtime boundary band (UV units). v maps 1:1 to mm (axial). Any hit within this of
+    // an envelope / polygon / hole edge is deferred to the exact OCCT intersector.
+    double band = 0.02;
+    t.band = band;
+    t.u0 = u0; t.u1 = u1; t.v0 = v0; t.v1 = v1;
+    t.periodic = fullU;
+
+    // --- Self-validation against BRepTopAdaptor_FClass2d (ground truth) ----------
+    // Dense random UV cloud over [u0,u1]×[v0,v1]. Points the model would DEFER (cls==-1,
+    // boundary band) are skipped — those take the exact OCCT path and cannot be wrong. We
+    // require ZERO disagreement on the points the fast path actually CLASSIFIES
+    // (cls∈{0,1}). A systematic model error misclassifies a large contiguous region, so a
+    // sparse random sample reliably hits it. This is the safety net: a model that does not
+    // validate keeps .valid=false and is never accelerated → correctness can't regress.
+    BRepTopAdaptor_FClass2d fclass(face, 1e-9);
+    auto selfValidate = [&](AlgoCache::UVTrim& cand, const char* tag) -> int {
+        std::mt19937_64 rng(0x5UL * (uint64_t)(uintptr_t)&fe + 0x9E3779B97F4A7C15ULL);
+        std::uniform_real_distribution<double> ru(u0, u1), rv(v0, v1);
+        const int valN = 2000;
+        int mism = 0;
+        for (int k = 0; k < valN && mism == 0; ++k) {
+            double u = ru(rng), v = rv(rng);
+            int cls = ClassifyUVTrim(cand, u, v);
+            if (cls < 0) continue;                  // deferred → never wrong
+            TopAbs_State st = fclass.Perform(gp_Pnt2d(u, v));
+            if (st == TopAbs_ON) continue;          // OCCT on-boundary → skip
+            bool myIn = (cls == 1), occtIn = (st == TopAbs_IN);
+            if (myIn != occtIn) ++mism;
+        }
+        return mism;
+    };
+
+    // ============================================================================
+    // ATTEMPT 1 — v-band model (the CT-TRIM model). Covers faces whose outer trim is
+    // a single bot(u)≤v≤top(u) envelope (parts 0/2/5/6/7/8/9). Cheapest classify.
+    // ============================================================================
+    {
+        const int NB = 2048;
+        const double du = (u1 - u0) / NB;
+        std::vector<double> top(NB, -1e300), bot(NB, 1e300);
+        std::vector<std::vector<double>> holeU, holeV;
+        bool sawOuter = false;
+        for (TopExp_Explorer ew(face, TopAbs_WIRE); ew.More(); ew.Next()) {
+            TopoDS_Wire wire = TopoDS::Wire(ew.Current());
+            std::vector<std::vector<std::pair<double,double>>> edgePolys;
+            double umin = 1e300, umax = -1e300;
+            for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
+                BRepAdaptor_Curve2d c2(we.Current(), face);
+                double t0 = c2.FirstParameter(), t1 = c2.LastParameter();
+                gp_Pnt2d a = c2.Value(t0), b = c2.Value(t1);
+                bool seam = (std::abs(a.X() - b.X()) < 1e-6 &&
+                             (std::abs(a.X() - u0) < 1e-3 || std::abs(a.X() - u1) < 1e-3));
+                if (seam) continue;
+                const int n = 512;
+                std::vector<std::pair<double,double>> poly; poly.reserve(n + 1);
+                for (int i = 0; i <= n; ++i) {
+                    double tt = t0 + (t1 - t0) * ((double)i / n);
+                    gp_Pnt2d q = c2.Value(tt);
+                    poly.emplace_back(q.X(), q.Y());
+                    umin = std::min(umin, q.X()); umax = std::max(umax, q.X());
+                }
+                edgePolys.push_back(std::move(poly));
+            }
+            if (edgePolys.empty()) continue;
+            bool outer = (umax - umin >= uspan - std::max(1e-2, 1e-2*uspan));
+            if (outer) {
+                sawOuter = true;
+                for (const auto& poly : edgePolys)
+                    for (size_t i = 0; i + 1 < poly.size(); ++i) {
+                        double ua = poly[i].first,  va = poly[i].second;
+                        double ub = poly[i+1].first, vb = poly[i+1].second;
+                        if (ua > ub) { std::swap(ua, ub); std::swap(va, vb); }
+                        int ba = std::max(0, std::min(NB-1, (int)((ua - u0) / du)));
+                        int bb = std::max(0, std::min(NB-1, (int)((ub - u0) / du)));
+                        for (int b = ba; b <= bb; ++b) {
+                            double uc = u0 + (b + 0.5) * du;
+                            double vv = (ub > ua) ? va + (vb - va)*((uc - ua)/(ub - ua)) : va;
+                            if (uc < ua) vv = va;
+                            if (uc > ub) vv = vb;
+                            top[b] = std::max(top[b], vv);
+                            bot[b] = std::min(bot[b], vv);
+                        }
+                    }
+            } else {
+                std::vector<double> hu, hv;
+                for (const auto& poly : edgePolys)
+                    for (const auto& q : poly) { hu.push_back(q.first); hv.push_back(q.second); }
+                if (hu.size() >= 3) { holeU.push_back(std::move(hu)); holeV.push_back(std::move(hv)); }
+            }
+        }
+        bool degenerate = !sawOuter;
+        if (!degenerate) {
+            for (int b = 1;    b < NB; ++b) if (top[b] < -1e299) { top[b]=top[b-1]; bot[b]=bot[b-1]; }
+            for (int b = NB-2; b >= 0; --b) if (top[b] < -1e299) { top[b]=top[b+1]; bot[b]=bot[b+1]; }
+            for (int b = 0; b < NB; ++b) if (top[b] < -1e299) { degenerate = true; break; }
+        }
+        if (!degenerate) {
+            AlgoCache::UVTrim band_t = t;
+            band_t.mode = AlgoCache::UVTrim::Mode::Band;
+            band_t.du = du; band_t.NB = NB;
+            band_t.top = top; band_t.bot = bot;
+            band_t.holeU = holeU; band_t.holeV = holeV;
+            band_t.valid = true;
+            if (selfValidate(band_t, "BAND") == 0) return band_t;   // band model is exact
+        }
+    }
+
+    // ============================================================================
+    // ATTEMPT 2 — general seam-aware polygon model (CT-TRIM-2). For faces whose outer
+    // trim is NOT a clean v-band (part_1's full-2π cylinders with a seam-crossing
+    // notch). Reconstruct every wire (seam edges INCLUDED) as a closed UV ring in the
+    // [u0,u1]×v plane by endpoint chaining, then classify by crossing-number:
+    // inside the even-odd union of the large rings (outer) AND not inside any small
+    // ring (hole). The seam is handled because the rings carry the vertical seam
+    // segments at u0/u1 explicitly — no unwrapping, no ±2π query shifting needed.
+    // ============================================================================
+    {
+        // Per-wire: build closed UV rings by chaining oriented edge polylines.
+        std::vector<std::vector<double>> outU, outV, holeU, holeV;
+        const double chainTol = 1e-4;              // endpoint match tolerance in UV
+        bool buildFail = false;
+        for (TopExp_Explorer ew(face, TopAbs_WIRE); ew.More(); ew.Next() ) {
+            TopoDS_Wire wire = TopoDS::Wire(ew.Current());
+            // Collect oriented edge polylines (apply edge orientation so each runs
+            // start→end along the wire's traversal direction).
+            struct Seg { std::vector<std::pair<double,double>> pts; };
+            std::vector<Seg> segs;
+            double wvmin = 1e300, wvmax = -1e300, wumin = 1e300, wumax = -1e300;
+            for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
+                BRepAdaptor_Curve2d c2(we.Current(), face);
+                double t0 = c2.FirstParameter(), t1 = c2.LastParameter();
+                const int n = 256;
+                Seg s; s.pts.reserve(n + 1);
+                for (int i = 0; i <= n; ++i) {
+                    double tt = t0 + (t1 - t0) * ((double)i / n);
+                    gp_Pnt2d q = c2.Value(tt);
+                    s.pts.emplace_back(q.X(), q.Y());
+                    wumin = std::min(wumin, q.X()); wumax = std::max(wumax, q.X());
+                    wvmin = std::min(wvmin, q.Y()); wvmax = std::max(wvmax, q.Y());
+                }
+                if (we.Current().Orientation() == TopAbs_REVERSED)
+                    std::reverse(s.pts.begin(), s.pts.end());
+                segs.push_back(std::move(s));
+            }
+            if (segs.empty()) continue;
+            // Greedy chain: start from seg 0, repeatedly attach the unused seg whose
+            // start (or end, reversing) matches the current chain end within chainTol.
+            // A periodic seam is fine: a seam edge at u0 and one at u1 are distinct
+            // segments whose endpoints match their neighbours in the [u0,u1] plane.
+            std::vector<char> used(segs.size(), 0);
+            std::vector<std::pair<double,double>> ring;
+            auto appendSeg = [&](std::vector<std::pair<double,double>>& dst,
+                                 const std::vector<std::pair<double,double>>& src,
+                                 bool skipFirst) {
+                for (size_t i = skipFirst ? 1 : 0; i < src.size(); ++i) dst.push_back(src[i]);
+            };
+            appendSeg(ring, segs[0].pts, false);
+            used[0] = 1;
+            size_t attached = 1;
+            while (attached < segs.size()) {
+                double ex = ring.back().first, ey = ring.back().second;
+                int best = -1; bool bestRev = false; double bestD = chainTol;
+                for (size_t s = 0; s < segs.size(); ++s) {
+                    if (used[s]) continue;
+                    double sx = segs[s].pts.front().first, sy = segs[s].pts.front().second;
+                    double tx = segs[s].pts.back().first,  ty = segs[s].pts.back().second;
+                    double d0 = std::hypot(ex - sx, ey - sy);
+                    double d1 = std::hypot(ex - tx, ey - ty);
+                    if (d0 <= bestD) { bestD = d0; best = (int)s; bestRev = false; }
+                    if (d1 <  bestD) { bestD = d1; best = (int)s; bestRev = true;  }
+                }
+                if (best < 0) { buildFail = true; break; }   // chain broke → bail to OCCT
+                std::vector<std::pair<double,double>> sp = segs[best].pts;
+                if (bestRev) std::reverse(sp.begin(), sp.end());
+                appendSeg(ring, sp, true);
+                used[best] = 1; ++attached;
+            }
+            if (buildFail) break;
+            // Ring must close (last ≈ first within a looser tol; the seam may leave a
+            // small gap). If it does not close, the chaining is unreliable → bail.
+            double cx = ring.front().first - ring.back().first;
+            double cy = ring.front().second - ring.back().second;
+            if (std::hypot(cx, cy) > 1e-2) { buildFail = true; break; }
+            std::vector<double> ru_, rv_;
+            ru_.reserve(ring.size()); rv_.reserve(ring.size());
+            for (auto& q : ring) { ru_.push_back(q.first); rv_.push_back(q.second); }
+            // Classify ring as outer vs hole by its u-extent: an outer ring of a
+            // full-2π face spans (nearly) the whole period; a hole is local. For a
+            // partial-u face the outer ring spans the face's u-extent.
+            bool isOuter = (wumax - wumin >= uspan - std::max(1e-2, 1e-2*uspan));
+            if (isOuter) { outU.push_back(std::move(ru_)); outV.push_back(std::move(rv_)); }
+            else         { holeU.push_back(std::move(ru_)); holeV.push_back(std::move(rv_)); }
+        }
+        if (!buildFail && !outU.empty()) {
+            AlgoCache::UVTrim poly_t = t;
+            poly_t.mode = AlgoCache::UVTrim::Mode::Poly;
+            poly_t.outU = outU; poly_t.outV = outV;
+            poly_t.holeU = holeU; poly_t.holeV = holeV;
+            poly_t.valid = true;
+            if (selfValidate(poly_t, "POLY") == 0) return poly_t;  // polygon model exact
+        }
+    }
+
+    // Neither model validated → keep .valid=false (OCCT intersector path, no regression).
+    return t;
+}
+
+// ====================================================================
+// CT-IN: analytic point-in-solid via ray parity
+// ====================================================================
+//
+// IntersectFaceForParity — append analytic ray-face hits for ONE face along the
+// ray (p, dir). `dir` MUST be unit length so all w-parameters are true distances
+// (keeps cylinder/sphere analytic roots consistent with the gp_Lin-based OCCT
+// intersector used for non-rectangular planes). Returns false only for a
+// non-analytic face type (Cone/Torus/Other) — the caller pre-screens solids so
+// this should not fire, but it guards against a mismatch between the coverage
+// flag and the per-face math.
+//
+// This mirrors the EXACT transition/UV math of RayCastToBoundary so that Inside()
+// and DistanceToIn/Out agree on whether a point is on/in/out of the boundary.
+bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
+                                         const G4ThreeVector& dir, G4double octTol,
+                                         std::vector<RayHit>& hits) const
+{
+    auto dot3 = [](double ax_, double ay_, double az_,
+                   double bx_, double by_, double bz_) {
+        return ax_*bx_ + ay_*by_ + az_*bz_;
+    };
+
+    // Non-analytic surface type → caller must not be here (solid pre-screened).
+    if (fe.surfType != FaceEntry::SurfType::Plane &&
+        fe.surfType != FaceEntry::SurfType::Cylinder &&
+        fe.surfType != FaceEntry::SurfType::Sphere)
+        return false;
+
+    // Trim-exact path: any face whose UV bounding rectangle is NOT its exact trim
+    // (non-rect plane, cylinder/sphere with cutouts or curved/partial trims).
+    if (!fe.analyticTrimSafe) {
+        AlgoCache* algo = GetAlgo();
+        int fi = (int)(&fe - &fFaces[0]);   // fe ∈ fFaces → recover global index
+
+        // ── CT-TRIM fast path: validated UV v-band trim model ──────────────────
+        // For full-periodic cylinder faces with a validated band model, compute the
+        // analytic ray-cylinder intersection (identical math to the trim-safe path)
+        // and classify each candidate root's UV hit against the band. If every root
+        // classifies cleanly (inside/outside, none in the boundary band), emit the
+        // analytic hits — no OCCT intersector. If ANY root is ambiguous (within the
+        // boundary band), discard all analytic results for this face and defer the
+        // whole face to the OCCT trim-exact intersector (preserves correctness).
+        const AlgoCache::UVTrim& tm =
+            (fi < (int)algo->faceUVTrim.size()) ? algo->faceUVTrim[fi]
+                                                : AlgoCache::UVTrim{};
+        if (tm.valid && fe.surfType == FaceEntry::SurfType::Cylinder) {
+            const gp_Ax3& ax    = fe.pos;
+            const gp_Dir& axDir = ax.Direction();
+            const gp_Pnt& axLoc = ax.Location();
+            const double   R    = fe.cylR;
+            double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
+            double da  = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
+            double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), dir.x(),dir.y(),dir.z());
+            double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
+            double vpx = dir.x()-va_*axDir.X(), vpy = dir.y()-va_*axDir.Y(), vpz = dir.z()-va_*axDir.Z();
+            double A = vpx*vpx + vpy*vpy + vpz*vpz;
+            bool   deferOCCT = false;
+            // Stage roots into a scratch list; commit only if no ambiguity.
+            struct Cand { double t; IntCurveSurface_TransitionOnCurve tr; double u, v; };
+            Cand staged[2];
+            int  nStaged = 0;
+            if (A >= 1e-30) {
+                double B    = ppx*vpx + ppy*vpy + ppz*vpz;
+                double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
+                double disc = B*B - A*C;
+                if (disc >= 0) {
+                    double sqrtD = std::sqrt(std::max(disc, 0.0));
+                    bool   tang  = (sqrtD < octTol * std::sqrt(A));
+                    bool   fwd   = (fe.face.Orientation() != TopAbs_REVERSED);
+                    auto tryRoot = [&](double t) {
+                        if (deferOCCT) return;
+                        if (t < -octTol) return;
+                        double v_ax = da + t * va_;
+                        // outside axial domain (with margin) → definitely off the face
+                        if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
+                        double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
+                        double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                        if (r < 1e-15) return;
+                        const gp_Dir& xu_c = ax.XDirection();
+                        const gp_Dir& yv_c = ax.YDirection();
+                        double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
+                                               dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
+                        if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
+                        // Classify (uf, v_ax) against the validated v-band trim.
+                        int cls = ClassifyUVTrim(tm, uf, v_ax);
+                        if (cls < 0) { deferOCCT = true; return; }  // boundary band → OCCT
+                        if (cls == 0) return;                        // off the real face
+                        IntCurveSurface_TransitionOnCurve trans;
+                        if (tang) {
+                            trans = IntCurveSurface_Tangent;
+                        } else {
+                            double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
+                            double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                            if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                            else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                            else                        trans = IntCurveSurface_Tangent;
+                        }
+                        staged[nStaged++] = { t, trans, uf, v_ax };
+                    };
+                    if (tang) {
+                        tryRoot(-B / A);
+                    } else {
+                        tryRoot((-B - sqrtD) / A);
+                        tryRoot((-B + sqrtD) / A);
+                    }
+                }
+            }
+            if (!deferOCCT) {
+                for (int s = 0; s < nStaged; ++s)
+                    hits.emplace_back(staged[s].t, staged[s].tr, fe.face,
+                                      staged[s].u, staged[s].v);
+                return true;
+            }
+            // fall through to OCCT for this face (a root was in the boundary band)
+        }
+
+        // Trim-exact OCCT path (faces without a validated band, or band-ambiguous hits).
+        // The per-face OCCT IntCurvesFace_Intersector respects the true trimmed boundary.
+        // Mandatory for ray parity — a single spurious hit on an over-covered UV
+        // rectangle flips inside/outside. Still ~150× cheaper than
+        // BRepClass3d_SolidClassifier::Perform (the pathology CT-IN replaced).
+        gp_Lin ray(G4toOCCT(p), gp_Dir(dir.x(), dir.y(), dir.z()));
+        IntCurvesFace_Intersector& inter = *algo->faceIntersectors[fi];
+        inter.Perform(ray, -octTol, kInfinity);
+        for (int j = 1; j <= inter.NbPnt(); ++j)
+            hits.emplace_back(inter.WParameter(j), inter.Transition(j),
+                              fe.face, inter.UParameter(j), inter.VParameter(j));
+        return true;
+    }
+
+    // ─── Plane (rectangular trim → UV box exact) ───────────────────────────
+    if (fe.surfType == FaceEntry::SurfType::Plane) {
+        const gp_Ax3& ax  = fe.pos;
+        const gp_Dir& nm  = ax.Direction();
+        const gp_Pnt& loc = ax.Location();
+        double nv = dot3(nm.X(),nm.Y(),nm.Z(), dir.x(),dir.y(),dir.z());
+        if (std::abs(nv) >= 1e-15) {
+            double np = dot3(nm.X(),nm.Y(),nm.Z(),
+                             p.x()-loc.X(), p.y()-loc.Y(), p.z()-loc.Z());
+            double t = -np / nv;
+            if (t >= -octTol) {
+                double hx = p.x()+t*dir.x()-loc.X();
+                double hy = p.y()+t*dir.y()-loc.Y();
+                double hz = p.z()+t*dir.z()-loc.Z();
+                const gp_Dir& xu = ax.XDirection();
+                const gp_Dir& yv = ax.YDirection();
+                double uf = dot3(xu.X(),xu.Y(),xu.Z(), hx,hy,hz);
+                double vf = dot3(yv.X(),yv.Y(),yv.Z(), hx,hy,hz);
+                if (uf >= fe.u0-octTol && uf <= fe.u1+octTol &&
+                    vf >= fe.v0-octTol && vf <= fe.v1+octTol) {
+                    bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+                    double n_out_v = fwd ? nv : -nv;
+                    IntCurveSurface_TransitionOnCurve trans;
+                    if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                    else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                    else                        trans = IntCurveSurface_Tangent;
+                    hits.emplace_back(t, trans, fe.face, uf, vf);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ─── Cylinder (full periodic, rectangular v-trim → UV box exact) ───────
+    if (fe.surfType == FaceEntry::SurfType::Cylinder) {
+        const gp_Ax3& ax    = fe.pos;
+        const gp_Dir& axDir = ax.Direction();
+        const gp_Pnt& axLoc = ax.Location();
+        const double   R    = fe.cylR;
+
+        double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
+        double da  = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
+        double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), dir.x(),dir.y(),dir.z());
+        double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
+        double vpx = dir.x()-va_*axDir.X(), vpy = dir.y()-va_*axDir.Y(), vpz = dir.z()-va_*axDir.Z();
+
+        double A = vpx*vpx + vpy*vpy + vpz*vpz;
+        if (A >= 1e-30) {
+            double B    = ppx*vpx + ppy*vpy + ppz*vpz;
+            double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
+            double disc = B*B - A*C;
+            if (disc >= 0) {
+                double sqrtD   = std::sqrt(std::max(disc, 0.0));
+                bool   tang    = (sqrtD < octTol * std::sqrt(A));
+                bool   fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
+                bool   fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+
+                auto tryRoot = [&](double t) {
+                    if (t < -octTol) return;
+                    double v_ax = da + t * va_;
+                    if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
+                    double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
+                    double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                    if (r < 1e-15) return;
+                    const gp_Dir& xu_c = ax.XDirection();
+                    const gp_Dir& yv_c = ax.YDirection();
+                    double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
+                                           dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
+                    if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
+                    if (!fullAng && (uf < fe.u0 - octTol || uf > fe.u1 + octTol)) return;
+                    IntCurveSurface_TransitionOnCurve trans;
+                    if (tang) {
+                        trans = IntCurveSurface_Tangent;
+                    } else {
+                        double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
+                        double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                        else                        trans = IntCurveSurface_Tangent;
+                    }
+                    hits.emplace_back(t, trans, fe.face, uf, v_ax);
+                };
+                if (tang) {
+                    tryRoot(-B / A);
+                } else {
+                    tryRoot((-B - sqrtD) / A);
+                    tryRoot((-B + sqrtD) / A);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ─── Sphere ───────────────────────────────────────────────────────────
+    if (fe.surfType == FaceEntry::SurfType::Sphere) {
+        const gp_Pnt& cen = fe.pos.Location();
+        const double   R  = fe.sphR;
+
+        double dpx = p.x()-cen.X(), dpy = p.y()-cen.Y(), dpz = p.z()-cen.Z();
+        double A    = dir.x()*dir.x() + dir.y()*dir.y() + dir.z()*dir.z();  // ≈ 1 (unit dir)
+        double B    = dpx*dir.x() + dpy*dir.y() + dpz*dir.z();
+        double C    = dpx*dpx + dpy*dpy + dpz*dpz - R*R;
+        double disc = B*B - A*C;
+        if (disc >= 0) {
+            double sqrtD   = std::sqrt(std::max(disc, 0.0));
+            bool   tang    = (sqrtD < octTol * std::sqrt(A));
+            bool   fullSph = (fe.u1-fe.u0 >= 2.0*M_PI-octTol &&
+                              fe.v1-fe.v0 >= M_PI-octTol);
+            bool   fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+
+            auto tryRoot = [&](double t) {
+                if (t < -octTol) return;
+                double qx = dpx+t*dir.x(), qy = dpy+t*dir.y(), qz = dpz+t*dir.z();
+                double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+                if (r < 1e-15) return;
+                double uf = 0.0, vf = 0.0;
+                if (!fullSph) {
+                    const gp_Dir& xu   = fe.pos.XDirection();
+                    const gp_Dir& yv_  = fe.pos.YDirection();
+                    const gp_Dir& zv_  = fe.pos.Direction();
+                    double xl = dot3(xu.X(),xu.Y(),xu.Z(), qx,qy,qz);
+                    double yl = dot3(yv_.X(),yv_.Y(),yv_.Z(), qx,qy,qz);
+                    double zl = dot3(zv_.X(),zv_.Y(),zv_.Z(), qx,qy,qz);
+                    uf = std::atan2(yl, xl);
+                    vf = std::asin(std::max(-1.0, std::min(1.0, zl/r)));
+                    if (uf < fe.u0 - octTol) uf += 2.0*M_PI;
+                    if (uf < fe.u0 - octTol || uf > fe.u1 + octTol) return;
+                    if (vf < fe.v0 - octTol || vf > fe.v1 + octTol) return;
+                }
+                IntCurveSurface_TransitionOnCurve trans;
+                if (tang) {
+                    trans = IntCurveSurface_Tangent;
+                } else {
+                    double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
+                    double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                    if      (n_out_v < -octTol) trans = IntCurveSurface_In;
+                    else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
+                    else                        trans = IntCurveSurface_Tangent;
+                }
+                hits.emplace_back(t, trans, fe.face, uf, vf);
+            };
+            if (tang) {
+                tryRoot(-B / A);
+            } else {
+                tryRoot((-B - sqrtD) / A);
+                tryRoot((-B + sqrtD) / A);
+            }
+        }
+        return true;
+    }
+
+    return false;  // non-analytic face type
+}
+
+// InsideSolidAnalytic — classify p against analytic solid `si` by ray parity.
+// Casts a deterministic ray, builds hit groups via GroupHits, and counts genuine
+// transversal crossings in front of p (w > 0). Odd ⇒ inside; even ⇒ outside.
+// If the nearest crossing group is within the solid band ⇒ kSurface. Degenerate
+// rays (grazing edges/vertices producing only Tangent groups near the parity
+// boundary, or an odd number of net-zero-cancelling groups) are retried with a
+// deterministically perturbed direction; `ok=false` if still ambiguous.
+EInside G4StepSolid::InsideSolidAnalytic(int si, const G4ThreeVector& p,
+                                         AlgoCache* algo, bool& ok) const
+{
+    ok = true;
+    const std::vector<int>& faceIdx = algo->solidFaceIdx[si];
+    const G4double band = algo->SolidBand(si);
+    // octTol is the global OCCT search/grouping window — reuse for hit grouping
+    // so coincident hits at shared edges merge exactly as in the ray path.
+    const G4double octTol = algo->occtTol;
+
+    // Deterministic ray directions: a primary axis-tilted dir, then perturbations.
+    // Tilted away from axes to avoid systematically grazing axis-aligned planes.
+    static const G4ThreeVector kDirs[4] = {
+        G4ThreeVector(0.5773502691896258, 0.5773502691896258, 0.5773502691896258),
+        G4ThreeVector(0.7745966692414834, 0.5163977794943222, 0.3651483716701107),
+        G4ThreeVector(-0.4264014327112209, 0.6396021490668313, 0.6396021490668313),
+        G4ThreeVector(0.3015113445777636, -0.9045340337332909, 0.3015113445777636)
+    };
+
+    std::vector<RayHit>& hits = algo->scratchInsideHits;
+
+    // Per-solid parity directions chosen at construction to avoid the OCCT
+    // intersector's direction-dependent pathology on BSpline-trimmed cylinders
+    // (a fixed diagonal can be 50–250× slower than a good direction). Fall back
+    // to the global kDirs if none were selected for this solid.
+    const std::vector<G4ThreeVector>* solidDirs =
+        (si < (int)algo->solidParityDirs.size() && !algo->solidParityDirs[si].empty())
+        ? &algo->solidParityDirs[si] : nullptr;
+    // Cap attempts: on these BSpline-trimmed solids each ray is expensive, so retry
+    // only a couple of perturbations before deferring to the OCCT classifier — fewer
+    // repeated slow rays trims the heavy tail without changing the result (the
+    // classifier is the authoritative fallback anyway).
+    const int maxAvail  = solidDirs ? (int)solidDirs->size() : 4;
+    const int nAttempts = std::min(2, maxAvail);
+
+    for (int attempt = 0; attempt < nAttempts; ++attempt) {
+        const G4ThreeVector& dir = solidDirs ? (*solidDirs)[attempt] : kDirs[attempt];
+        hits.clear();
+        bool allAnalytic = true;
+        for (int fi : faceIdx) {
+            if (!IntersectFaceForParity(fFaces[fi], p, dir, octTol, hits)) {
+                allAnalytic = false;
+                break;
+            }
+        }
+        if (!allAnalytic) { ok = false; return kOutside; }
+
+        GroupHits(hits, algo->scratchGroups, octTol);
+
+        // Classify groups. A "crossing" is a group with a net transition
+        // (nIn != nOut); these are the genuine boundary penetrations. Tangent-only
+        // groups (nIn==nOut==0) were already dropped by GroupHits. A group that
+        // carries hits but nets to zero (nIn==nOut>0) is a grazing coincidence
+        // (e.g. ray tangent to a shared edge) → flag ambiguous and retry.
+        //
+        // Closed-manifold invariant: a non-degenerate ray crosses a closed solid
+        // boundary an EVEN number of times total (every entry has a matching exit).
+        // If totalCross is ODD, the ray grazed/clipped a boundary and the parity is
+        // unreliable → perturb and retry; after all retries → OCCT classifier
+        // fallback. This is the guard against the spurious-hit "explosion" family.
+        int  parity      = 0;   // forward (dist > band) crossings → inside test
+        int  totalCross  = 0;   // all crossings (any dist) → even-parity invariant
+        bool nearSurface = false;
+        bool ambiguous   = false;
+        for (const auto& g : algo->scratchGroups) {
+            bool crossing = (g.nIn != g.nOut);
+            bool graze    = (!crossing && (g.nIn + g.nOut) > 0);
+            if (std::abs(g.dist) <= band) {
+                // Group essentially AT the point → on the surface.
+                if (crossing || graze) nearSurface = true;
+                continue;
+            }
+            if (crossing) {
+                ++totalCross;
+                if (g.dist > band) ++parity;
+            } else if (graze) {
+                ambiguous = true;
+            }
+        }
+
+        if (nearSurface) return kSurface;
+        // Odd total crossings ⇒ grazing/clipping artifact ⇒ unreliable parity.
+        if (totalCross & 1) ambiguous = true;
+        if (ambiguous) {
+            if (attempt < nAttempts - 1) continue;  // perturb ray and recount
+            ok = false; return kOutside;            // give up → caller uses OCCT classifier
+        }
+        return (parity & 1) ? kInside : kOutside;
+    }
+    ok = false;
+    return kOutside;
 }
