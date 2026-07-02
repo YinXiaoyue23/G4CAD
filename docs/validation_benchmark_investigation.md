@@ -414,3 +414,84 @@ All five issues were resolved.  After all fixes (10 000-event runs):
 **Step-count inflation — root cause and fix.**  `G4StepSolid::DistanceToOut(p)` was returning 0 for 100 % of interior points because `NearestFace()` reused a single `BRepExtrema_DistShapeShape` object across all faces via `LoadS2`, and OCCT's stale internal state from the first face poisoned all subsequent face queries.  The geantino control test confirmed the inflation was exclusively MSC-driven (geantino: native = STEP = 3 steps; electron: was 4–6× inflated).
 
 The fix — constructing a fresh `BRepExtrema_DistShapeShape(vtxShape, face)` per face — completely resolved the issue.  Safety now matches native to < 0.001 % across all 550 sampled interior points per geometry, and step counts are statistically indistinguishable from native analytic solids.
+
+---
+
+## 7. box_hole Edep gap — definitive root cause (2026-07-02)
+
+§6 attributed the residual box\_hole energy-deposition gap to "`G4SubtractionSolid`
+safety underestimation near the hole rim." A rigorous native-vs-step step-trace
+investigation supersedes that description: the gap is **not** a solid-query error
+at all. This section records the definitive root cause and the decision to accept
+the gap.
+
+### 7.1 Symptom (current)
+
+At 5 000 events, box\_hole edep: native = 9.628 ± 0.013 MeV, step = 9.537 ± 0.013 MeV.
+Gap = **0.091 MeV ≈ 0.95 %, ≈ 5 σ** (real, systematic). Step-mode tracks are
+*longer* (492 vs 446 mm) yet deposit *less* energy and take *fewer* steps
+(24.8 vs 27.1) — energy is carried out of the material rather than deposited.
+
+### 7.2 Mechanism — `fBlockedPhysicalVolume` ghost steps
+
+The benchmark gun is deterministic (e⁻, 10 MeV, fixed position (30,0,−200), +z) and
+the seed is fixed (42), so event *N* is step-for-step identical between native and
+step until geometry navigation first diverges. Tracing confirms the loss sequence:
+
+1. An electron diffuses (MSC) to the cylindrical hole wall and **exits the solid
+   into the hole** at r ≈ 20 mm (a clean geometry-boundary step, `post_stat=Geom`).
+2. Geant4's navigator marks the just-exited volume `fBlockedPhysicalVolume` — it is
+   blocked from re-entry for exactly **one** step (a convex-solid optimisation).
+3. The next step is therefore **physics-limited** (`post_stat=Physics`): with the
+   solid blocked, `DistanceToIn` is *not* consulted, the only geometry boundary is
+   the distant World, and MSC takes a large step (tens–hundreds of mm) that
+   traverses solid Si **as if it were vacuum** — depositing ≈ 0. This is the
+   "ghost step."
+4. Depending on where the ghost step ends, the particle either re-enters (recovered
+   by the DistanceToIn Inside-check, commit a5c8498) or escapes the box entirely
+   (500-event run: 33 escapes for step vs 8 for native).
+
+### 7.3 The solid is not at fault — every query matches native
+
+All `G4StepSolid` responses the navigator can query were compared to native
+G4SubtractionSolid at the exact wall configuration:
+
+| Query | native vs step |
+|---|---|
+| Isotropic safety at wall (`GetSafety`) | both 0 |
+| `Inside()` classification (20 000-pt grid + wall points) | 0 mismatches |
+| `DistanceToOut(p,v)` toward hole (20 000 pts) | max 3.5 × 10⁻¹⁵ mm |
+| Isotropic safety `DistanceToOut(p)` | ratio = 1.0 (identical means) |
+| `DistanceToIn/Out(p,v)` (nav-test, 50 000 rays) | 0 mismatch, ≤ 4.5 × 10⁻¹³ mm |
+
+The solid matches native to machine precision on every path. The ghost step arises
+purely from the navigator's one-step blocking of a single **concave** BREP solid,
+which native (a boolean composition) happens to suffer ≈ 4× less often (26 vs 6
+qualifying ghost steps / 500 events) for reasons internal to the navigator, not
+expressible through the `G4VSolid` interface.
+
+### 7.4 A genuine latent bug found and fixed (commit 27b30bb)
+
+The investigation surfaced one real `DistanceToIn(p,v)` bug via a dedicated
+wall-crossing probe: for a point **inside** the solid (r = R+ε near the concave
+wall) heading across the hole, step returned the far-wall re-entry distance
+(~40 mm) instead of **0**. Native returns 0 (Geant4 convention). Fixed in
+`RayCastToBoundary`: the first forward net-crossing being an *Exit* means p is
+inside ⇒ return 0. All correctness gates still pass.
+
+However, this fix leaves the box\_hole edep **byte-identical**: during the blocked
+ghost step the solid is blocked, so `DistanceToIn` is never called there. The fix
+is a latent-correctness improvement, effective only in combination with a mechanism
+that shortens the blocked step (a `G4UserLimits` max-step cap would clear the block
+early and let the corrected `DistanceToIn` re-enter immediately).
+
+### 7.5 Decision — accept the gap
+
+The 0.9 %/5 σ box\_hole edep gap is an **inherent limitation of navigating a single
+concave BREP solid in Geant4**, not a G4CAD defect. It is not addressable through
+the solid's geometry interface. The only lever is a global max-step cap
+(`G4UserLimits` + `G4StepLimiter`), which trades simulation speed for accuracy and
+changes physics configuration for all geometries — out of scope for the solid.
+**Decision (2026-07-02): accept the gap; no further changes to G4StepSolid for
+box\_hole edep.** The DistanceToIn correctness fix (27b30bb) is retained on its own
+merits.
