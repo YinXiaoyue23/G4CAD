@@ -464,11 +464,14 @@ G4SubtractionSolid at the exact wall configuration:
 | Isotropic safety `DistanceToOut(p)` | ratio = 1.0 (identical means) |
 | `DistanceToIn/Out(p,v)` (nav-test, 50 000 rays) | 0 mismatch, ≤ 4.5 × 10⁻¹³ mm |
 
-The solid matches native to machine precision on every path. The ghost step arises
-purely from the navigator's one-step blocking of a single **concave** BREP solid,
-which native (a boolean composition) happens to suffer ≈ 4× less often (26 vs 6
-qualifying ghost steps / 500 events) for reasons internal to the navigator, not
-expressible through the `G4VSolid` interface.
+The solid matches native to machine precision on every path *listed above*. The
+ghost step arises from the navigator's one-step blocking of a single **concave**
+BREP solid, which native (a boolean composition) suffers ≈ 4× less often (26 vs 6
+qualifying ghost steps / 500 events). §7.3 originally concluded this difference was
+"not expressible through the `G4VSolid` interface" — that was **wrong**: the table
+above omitted one interface output, the *exit-normal validity flag* returned by
+`DistanceToOut(p, v, calcNorm=true, &validNorm, &n)`. That flag was the sole
+differentiator, and it is fixable (see §7.6).
 
 ### 7.4 A genuine latent bug found and fixed (commit 27b30bb)
 
@@ -485,13 +488,60 @@ is a latent-correctness improvement, effective only in combination with a mechan
 that shortens the blocked step (a `G4UserLimits` max-step cap would clear the block
 early and let the corrected `DistanceToIn` re-enter immediately).
 
-### 7.5 Decision — accept the gap
+### 7.5 First (premature) conclusion — superseded by §7.6
 
-The 0.9 %/5 σ box\_hole edep gap is an **inherent limitation of navigating a single
-concave BREP solid in Geant4**, not a G4CAD defect. It is not addressable through
-the solid's geometry interface. The only lever is a global max-step cap
-(`G4UserLimits` + `G4StepLimiter`), which trades simulation speed for accuracy and
-changes physics configuration for all geometries — out of scope for the solid.
-**Decision (2026-07-02): accept the gap; no further changes to G4StepSolid for
-box\_hole edep.** The DistanceToIn correctness fix (27b30bb) is retained on its own
-merits.
+An initial reading concluded the gap was an *inherent, unfixable* limitation of
+navigating a single concave BREP solid, addressable only by a global max-step cap.
+**That conclusion was wrong** and is retained here only as a record of the
+investigation. Continued digging into `G4Navigator`'s source (§7.6) found the exact
+trigger — an interface output the §7.3 table had not compared — and it is fixable
+in G4StepSolid.
+
+### 7.6 Root cause and fix — exit-normal validity flag (commit 0ab3e3e)
+
+**Trigger (from Geant4 source + controlled navigator experiment).**
+`G4NormalNavigation::ComputeStep` applies an *exit-block* optimisation: after a
+track exits a daughter **through a valid exit normal**
+(`localDirection.dot(exitNormal) >= kMinExitingNormalCosine`), that daughter is
+skipped for one step to avoid immediate re-entry. This is sound only for a locally
+convex exit. At the concave hole wall the track *does* re-enter (across the cavity),
+so skipping it produces the ghost step.
+
+A controlled experiment drove a real `G4Navigator` through the exit→relocate→step
+sequence with **identical** start configs for native and step. Every solid output
+was identical — exit-normal *vector* `(-1,0,0)`, `Inside` = kSurface, `SurfaceNormal`,
+`DistanceToIn/Out` values, and the solid tolerance (swept 1e-7 → 1e-11, no effect) —
+**except one**: the `validNorm` flag from `DistanceToOut(..., calcNorm=true, ...)`.
+
+| | exit-normal vector | **validNorm** | next step |
+|---|---|---|---|
+| native G4SubtractionSolid | (-1, 0, 0) | **false** | 41.8 mm (re-enters) |
+| step G4StepSolid (pre-fix) | (-1, 0, 0) | **true** | 334 mm (**ghost**) |
+
+Native returns `validNorm=false` at the subtracted (concave) surface, which
+disables the optimisation; G4StepSolid confidently returned `true`, enabling the
+unsafe block. That flag alone flipped re-enter vs ghost.
+
+**Fix.** In `RayCastToBoundary`'s `DistanceToOut` path, report the exit normal as
+**invalid** when the ray has a further net-*Entry* crossing beyond the exit — i.e.
+the ray re-enters the solid. This reuses the hit groups already computed for the
+exit distance (no extra ray cast) and is direction-precise; convex exits (no
+re-entry ahead) keep `validNorm=true`, preserving the navigator optimisation.
+
+**Result (box_hole, 5000 ev, single-thread, reproducible):**
+
+| | native | step | gap |
+|---|---|---|---|
+| before | 9.6280 | 9.5369 | −0.091 MeV (**5 σ**) |
+| after (0ab3e3e) | 9.6280 | 9.6467 | +0.019 MeV (**1.0 σ**, ≈ 0) |
+
+Step track length 491.7 → 434.1 mm (ghost travel eliminated; native 446.5). Native
+edep byte-identical before/after (fix touches only G4StepSolid). All gates still
+pass: nav-test 0 mismatch / max_dev_in ≤ 4.5×10⁻¹³ mm on 5 geometries; safety
+ratio = 1; cross-section 0/250000; convex geometries (box/sphere/cylinder/touching)
+edep unchanged within noise.
+
+**Decision (2026-07-02): the box_hole edep gap is closed by commit 0ab3e3e.** The
+DistanceToIn Inside-check (27b30bb) is retained; it is the necessary partner — once
+the block is lifted, `DistanceToIn` at the mis-located interior point must return 0
+for a clean immediate re-entry.
