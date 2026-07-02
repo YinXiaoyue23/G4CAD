@@ -674,7 +674,19 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     }
 
     if (rawHits.empty()) {
-        if (kind == BoundaryKind::Entry) return kInfinity;
+        if (kind == BoundaryKind::Entry) {
+            // No forward intersection found — all cylinder/plane/sphere roots were
+            // behind the particle (negative t). This can happen when the particle
+            // overshoots a concave boundary by a tiny floating-point amount (e.g.
+            // DistanceToOut stepped from Si past the inner cylinder wall by ε, the
+            // navigator placed the particle in World, but the physical position is
+            // r = R+ε still inside Si). If Inside(p) confirms the particle is on or
+            // inside the solid, return kCarTolerance so the navigator can correct the
+            // volume assignment with a harmless micro-step.
+            if (Inside(p) != kOutside)
+                return kCarTolerance;
+            return kInfinity;
+        }
         G4double t = kInfinity;
         if (v.x() > 0.0)       t = std::min(t, (fXmax - p.x()) / v.x());
         else if (v.x() < 0.0)  t = std::min(t, (fXmin - p.x()) / v.x());
@@ -733,6 +745,27 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     }
 
     if (kind == BoundaryKind::Entry) {
+        // No valid Entry boundary group found. Three legitimate causes:
+        // (a) On-surface (distance ≈ 0): a group exists at t≈0 but was classified Out
+        //     (e.g. inner cylinder of a subtraction solid has REVERSED orientation, so an
+        //     inward-approaching particle at the concave surface gets trans=Out).
+        // (b) MSC overshoot near surface: DistanceToOut returned exact r=R, but MSC
+        //     laterally displaced the endpoint by δ (10–500 nm), putting the particle at
+        //     r=R+δ still inside the solid but the navigator already transitioned it to
+        //     World. Near-side hit is at t≈δ/v_r and also has trans=Out.
+        // (c) Deep mis-tracking: after a physics-limited step that crossed the solid
+        //     boundary (e.g. traversing a concave hole), the particle ends up deep inside
+        //     the solid but is still tracked in World. All forward hits are Exit transitions
+        //     (particle heading outward through the solid). Inside(p) confirms mis-tracking.
+        // Cases (a)/(b): smallest group dist < octTol*1e4 ≈ 1 µm.
+        // Case (c): Inside(p) != kOutside.
+        if (!algo->scratchGroups.empty()) {
+            const G4double dMin = algo->scratchGroups.front().dist;
+            if (dMin >= 0.0 && dMin < octTol * 1e4)
+                return kCarTolerance;
+        }
+        if (Inside(p) != kOutside)
+            return kCarTolerance;
         if (fVerboseLevel >= 2)
             G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
                    << " no real boundary -> kInfinity" << G4endl;
