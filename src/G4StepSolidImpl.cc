@@ -713,6 +713,33 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 
     GroupHits(rawHits, algo->scratchGroups, octTol);
     for (const auto& g : algo->scratchGroups) {
+        // Inside-detection for DistanceToIn. RayCast collects forward hits only,
+        // so the FIRST forward net-crossing group decides p's location relative to
+        // the solid. If that crossing is an EXIT (nOut>nIn), the ray leaves the
+        // solid before entering it → p is already inside → DistanceToIn = 0, which
+        // matches native G4SubtractionSolid and the Geant4 convention. The old
+        // behaviour skipped Exit groups and returned the FAR-wall re-entry distance,
+        // so a particle mis-located in World but physically inside a concave solid
+        // (after exiting the inner hole wall) was handed a ~40 mm re-entry distance
+        // and ghost-stepped through the material as vacuum, losing energy. Only the
+        // first forward net-crossing is consulted; net-zero/grazing groups skipped.
+        if (!wantExit) {
+            const int net = g.nIn - g.nOut;
+            if (net == 0) continue;                    // net-zero / tangent / grazing
+            const G4double bandE = bandOf(g);
+            if (std::abs(g.dist) < bandE) return 0.0;  // on surface
+            if (g.dist > bandE) {
+                if (net < 0) {                         // first crossing is EXIT → inside
+                    if (fVerboseLevel >= 2)
+                        G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
+                               << " first forward crossing is Exit -> p inside -> 0.0" << G4endl;
+                    return 0.0;
+                }
+                return g.dist;                         // net > 0 → genuine forward entry
+            }
+            continue;                                  // behind the point → ignore
+        }
+
         if (!isBoundaryGroup(g)) continue;
 
         const G4double band = bandOf(g);
