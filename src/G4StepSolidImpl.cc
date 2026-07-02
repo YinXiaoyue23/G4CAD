@@ -711,6 +711,28 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         return net > 0;
     };
 
+    // Re-entrancy test for the DistanceToOut exit-normal validity flag. Geant4's
+    // navigator applies an "exit block" optimisation — after a track exits a
+    // daughter through a VALID exit normal, that daughter is skipped for one step
+    // to avoid immediate re-entry (see G4NormalNavigation::ComputeStep,
+    // localDirection.dot(exitNormal) >= kMinExitingNormalCosine). That is only
+    // safe for a locally convex exit. For a concave / re-entrant exit — e.g.
+    // leaving the inner wall of a cylindrical hole and crossing the cavity back
+    // into the SAME solid — the ray genuinely re-enters, and skipping it makes the
+    // track ghost-step through the material as if it were vacuum (energy loss).
+    // Native G4SubtractionSolid returns validNorm=false at such exits, which
+    // disables the optimisation and lets the navigator re-enter correctly. We
+    // reproduce that: report the exit normal as INVALID when the ray has a further
+    // net-Entry crossing beyond this exit (using hits already computed here — no
+    // extra ray cast). Convex exits (no re-entry ahead) keep validNorm=true so the
+    // navigator optimisation is preserved.
+    auto reentersAfter = [&](G4double exitDist) -> bool {
+        for (const auto& g2 : algo->scratchGroups)
+            if ((g2.nIn - g2.nOut) > 0 && g2.dist > exitDist + octTol)
+                return true;
+        return false;
+    };
+
     GroupHits(rawHits, algo->scratchGroups, octTol);
     for (const auto& g : algo->scratchGroups) {
         // Inside-detection for DistanceToIn. RayCast collects forward hits only,
@@ -746,7 +768,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         if (std::abs(g.dist) < band) {
             if (calcNorm && validNorm && !g.outFace.IsNull()) {
                 *n = GetNormalAtIntersection(g.outFace, g.outU, g.outV);
-                *validNorm = true;
+                *validNorm = !reentersAfter(g.dist);
             }
             if (fVerboseLevel >= 2) {
                 G4cout << "[G4StepSolid::" << GetName() << "::" << fnName << "][local]"
@@ -759,7 +781,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         if (g.dist > band) {
             if (calcNorm && validNorm && !g.outFace.IsNull()) {
                 *n = GetNormalAtIntersection(g.outFace, g.outU, g.outV);
-                *validNorm = true;
+                *validNorm = !reentersAfter(g.dist);
             }
             if (fVerboseLevel >= 2) {
                 G4cout << "[G4StepSolid::" << GetName() << "::" << fnName << "][local]"
