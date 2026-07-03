@@ -545,3 +545,54 @@ edep unchanged within noise.
 DistanceToIn Inside-check (27b30bb) is retained; it is the necessary partner — once
 the block is lifted, `DistanceToIn` at the mis-located interior point must return 0
 for a clean immediate re-entry.
+
+### 7.7 Open item — step-count residual and the MSC step-size question (not yet verified)
+
+Two loose ends remain after the fix. Neither affects the scalar physics results
+verified above, but both are worth closing when time permits.
+
+**Observations.**
+- box_hole STEP now takes ~30 % *more* steps than native (32.7 vs 27.1) and is
+  ~20 % slower (1.35 s vs 1.11 s, 5000 ev / 1 thread). This is *not* a regression:
+  the pre-fix low count (24.8) was itself an artifact — the ghost step teleported
+  through the material, skipping the steps (and the energy) it should have taken.
+  The fix exposes the honest, higher count. Verified this is NOT caused by the
+  27b30bb DistanceToIn=0 micro-steps: temporarily returning the far-wall distance
+  instead of 0 left the step count unchanged (32.7). It is the genuine BREP
+  traversal of the concave region.
+- sphere STEP also takes ~+5 steps and shows a boundary-crossing excess — a
+  *separate*, convex-geometry residual, most likely the OCCT sphere pole/seam
+  (degenerate BREP points). Cylinder (curved, no poles) matches native; box /
+  touching (planar) match. So the step residual tracks "hard" features:
+  concave holes and poles.
+
+**Why edep-match alone is not full proof.** Matching *total* edep (a scalar) and
+*total* track length is necessary but not sufficient — two runs can agree on
+integrals while differing in the spatial distribution. The strong correctness
+argument is geometric fidelity (nav-test 1e-13, Inside 0-mismatch, safety, volume):
+Geant4 physics = (physics list) × (geometry queries), and both are proven identical,
+so the particle samples the same material everywhere. The **one genuine residual
+risk** is that Geant4 condensed-history **MSC is not perfectly step-size
+independent** — taking ~30 % more steps could, in principle, leak a small physics
+difference through MSC. The matching total edep *and* track length bound it to be
+small (and most extra steps are in the vacuum hole, where MSC is inert), but it has
+not been *directly* checked.
+
+**Verification method to close it (differential observables).** Add a temporary
+recorder in `SteppingAction` (self-contained: file-static histograms dumped at exit
+to `$G4CAD_DIFF_OUT`, keyed per run; run single-thread for reproducibility) that
+accumulates, for the primary and its shower:
+1. **Longitudinal edep profile** — edep vs z (step midpoint), 40 bins over [−100,100].
+2. **Transverse edep profile** — edep vs transverse distance from the beam axis
+   (x=30, y=0), i.e. √((x−30)²+y²), 30 bins over [0,60] — the MSC lateral-spread
+   observable.
+3. **Primary exit angle** — cos θ of the primary's final momentum vs the +z launch
+   direction, recorded when `GetTrackStatus() != fAlive`, 40 bins over [−1,1] — the
+   most MSC-sensitive observable.
+Run native and STEP at high stats (≥20 000 ev), compare the three histograms.
+**Pass criterion:** all three differential distributions agree within Poisson
+statistics. If they do, the step-count difference is confirmed purely cosmetic and
+the simulation is verified at the differential level; if the transverse profile or
+cos θ disagree, MSC step-dependence is real and step-limiting (`G4UserLimits` /
+range factor) would need tuning. (A draft of this recorder was written and reverted
+on 2026-07-03; not yet run.)
