@@ -596,3 +596,41 @@ the simulation is verified at the differential level; if the transverse profile 
 cos θ disagree, MSC step-dependence is real and step-limiting (`G4UserLimits` /
 range factor) would need tuning. (A draft of this recorder was written and reverted
 on 2026-07-03; not yet run.)
+
+## 8. Open item — Roman Pot (RP.step) stuck-track warnings (deferred)
+
+The realistic ALADDIN Roman Pot CAD assembly (`share/example/RP.step`, 13 solids,
+474 faces, planes/cylinders/cones/tori) imports and simulates to completion, but a
+2000-event e⁻ run produces ~1133 Geant4 "stuck-track" self-recovery warnings
+(≈57% of events). Diagnosed 2026-07-06/07:
+
+- **Not a volumetric overlap.** 2×10⁶ random points in the global bbox: **zero**
+  points inside ≥2 solids. The 13 components do not interpenetrate; the CAD is
+  geometrically sound. (Bounding boxes overlap heavily — thin-walled nested
+  parts — but that is bbox, not material.)
+- A few adjacent solids nearly touch: solids 5&12 and 6&12 at ~−0.03 mm; 3&6,
+  4&5 at ~+0.5 mm.
+- Stuck-track oscillation is always `solid ↔ world` (never `solid_A ↔ solid_B`),
+  spread across many solids' own BREP surfaces (e.g. step_part_2 at the r≈40 mm
+  cylinder near z≈−183; step_part_12 at the z=−12 plane). This is a **G4StepSolid
+  boundary-navigation robustness issue** (grazing / thin-wall / near-coincident
+  surfaces), same family as the box_hole navigation work but a different symptom
+  (oscillation, not ghost-step). Geant4's "Likely geometry overlap" text is only
+  its default guess when a track fails to advance — it does not imply a real
+  overlap.
+- **Surface tolerance band is NOT the cause.** RP faces have tight tolerance
+  (1e-7 mm) but edges are loose (max 24.8 µm), inflating the per-solid band to
+  ~0.05 mm via `ShapeNoise` (max over faces+edges+vertices). Rebuilding with
+  `ShapeNoise` restricted to faces only (band → 2e-7 mm) left the stuck-track
+  count byte-identical (1133) — refuted.
+
+All events complete; physics quantities are stable; the push (1 nm) self-recovers
+every case. For the paper this is reported as "imports and navigates to completion
+with self-recovering navigation warnings," not as a zero-warning production
+geometry.
+
+**To resolve (deferred, high effort):** isolate the dominant stuck configuration
+(grazing vs thin-wall vs near-coincident) with a targeted probe as done for
+box_hole, then improve `DistanceToIn/Out` so a track near a surface always makes a
+minimum meaningful step. Geant4-level mitigations that need no G4CAD change:
+`G4UserLimits` max-step + `G4StepLimiter`, or a larger navigator push tolerance.
