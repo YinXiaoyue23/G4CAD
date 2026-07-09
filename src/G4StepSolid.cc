@@ -159,6 +159,8 @@ G4StepSolidImpl::G4StepSolidImpl(const TopoDS_Shape& stepShape, G4double toleran
 
     CalcBBox();
     BuildFaceWeights();
+    BuildSharedGeom();   // P2: build the read-only, thread-shared geometry ONCE here
+                         // (master thread) instead of per-thread in each AlgoCache.
 
     // Enable per-call timing when G4CAD_TIMER is set; zero overhead otherwise.
     if (G4StepConfig::Get().timing) SetTimingEnabled(true);
@@ -356,21 +358,21 @@ EInside G4StepSolidImpl::Inside(const G4ThreeVector& p) const {
     EInside result = kOutside;
     const gp_Pnt pt = G4toOCCT(p);
     for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
-        if (algo->solidBoxes[i].IsOut(pt)) continue;
+        if (solidBoxes[i].IsOut(pt)) continue;
 
         // CT-IN: analytic point-in-solid via ray parity for solids whose faces are
         // ALL analytic-complete types (Plane/Cylinder/Sphere). Solids with Cone or
         // Torus faces fall back to BRepClass3d_SolidClassifier::Perform unchanged.
         // This replaces the per-call OCCT classifier (594k–1.5M ns/call pathology
         // on RP.step parts 0/1/2) with a sub-µs analytic ray cast.
-        if (algo->analyticInsideOK[i] && !sInsideForceOCCT) {
+        if (analyticInsideOK[i] && !sInsideForceOCCT) {
             bool ok = true;
             EInside ai = InsideSolidAnalytic((int)i, p, algo, ok);
             if (ok) {
                 // CT-IN debug self-check: compare analytic vs OCCT per solid.
                 static bool selfcheck = G4StepConfig::Get().insideSelfcheck;
                 if (selfcheck) {
-                    algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
+                    algo->solidClassifiers[i]->Perform(pt, SolidBand((int)i));
                     auto st = algo->solidClassifiers[i]->State();
                     EInside occt = (st==TopAbs_IN) ? kInside : (st==TopAbs_ON) ? kSurface : kOutside;
                     if (occt != ai) {
@@ -388,7 +390,7 @@ EInside G4StepSolidImpl::Inside(const G4ThreeVector& p) const {
         }
 
         if (fTimingEnabled) ++algo->timing.insideFallbackCount;
-        algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
+        algo->solidClassifiers[i]->Perform(pt, SolidBand((int)i));
         auto s = algo->solidClassifiers[i]->State();
         if (s == TopAbs_IN) { result = kInside; break; }
         if (s == TopAbs_ON) result = kSurface;

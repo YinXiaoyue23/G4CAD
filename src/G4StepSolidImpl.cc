@@ -307,24 +307,25 @@ void G4StepSolidImpl::GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>
 // ====================================================================
 // AlgoCache
 // ====================================================================
-int G4StepSolidImpl::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
+int G4StepSolidImpl::FaceToSolid(const TopoDS_Face& f) const {
     if (faceSolidMap.IsBound(f)) return faceSolidMap.Find(f);
     return -1;
 }
 
-G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
-                                   const G4StepSolidImpl* ownerSolid)
-    : owner(ownerSolid)
+// Build the read-only, thread-shared geometry ONCE (called from the Impl ctor, which
+// runs single-threaded in the Geant4 master thread before any worker/AlgoCache exists).
+// This is the work that used to be redone per-thread in the AlgoCache ctor (CT-TRIM
+// models + parity-direction selection dominate); now it happens once and every
+// per-thread AlgoCache just reads it via its owner (P2).
+void G4StepSolidImpl::BuildSharedGeom()
 {
-    requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
-
+    requestedTol = (fTolerance > 0.0) ? fTolerance : 1e-7;
     perSolidTol = G4StepConfig::Get().perSolidTol;
 
     G4double globalMax = requestedTol;
-    int si = 0;
-    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next(), ++si) {
+    for (TopExp_Explorer ex(fShape, TopAbs_SOLID); ex.More(); ex.Next()) {
         const TopoDS_Shape& s = ex.Current();
-        solidClassifiers.push_back(std::make_unique<BRepClass3d_SolidClassifier>(s));
+        const int si = (int)solidTol.size();
         G4double sigma = ShapeNoise(s);
         G4double band  = std::max(requestedTol, 2.0 * sigma);
         solidTol.push_back(band);
@@ -337,80 +338,54 @@ G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolera
     occtTol = perSolidTol ? globalMax : requestedTol;
     if (solidTol.empty()) { solidTol.push_back(requestedTol); occtTol = requestedTol; }
 
-    for (const auto& fe : ownerSolid->fFaces)
-        faceIntersectors.push_back(new IntCurvesFace_Intersector(fe.face, occtTol));
-
-    for (const auto& fe : ownerSolid->fFaces) {
-        auto* dss = new BRepExtrema_DistShapeShape();
-        dss->LoadS2(fe.face);
-        faceExtrema.push_back(dss);
-    }
-
-    const size_t nFaces = ownerSolid->fFaces.size();
-    scratchHits.reserve(2 * nFaces);
-    scratchGroups.reserve(nFaces);
-    scratchInsideHits.reserve(2 * nFaces);
-    scratchFaceOrder.reserve(nFaces);  // CT1: one entry per face
-
-    // --- CT-IN: build per-solid face index lists + analytic-Inside coverage flags ---
-    // solidClassifiers has one entry per TopAbs_SOLID (built above, same `si` order).
-    // For each face in fFaces, look up its owning solid via faceSolidMap and bucket it.
-    const size_t nSolids = solidClassifiers.size();
+    // --- CT-IN: per-solid face index lists + analytic-Inside coverage flags ---
+    const size_t nSolids = solidBoxes.size();
     solidFaceIdx.assign(nSolids, {});
     analyticInsideOK.assign(nSolids, 1);  // start true; cleared by any non-analytic face
-    for (int fi = 0; fi < (int)ownerSolid->fFaces.size(); ++fi) {
-        const TopoDS_Face& f = ownerSolid->fFaces[fi].face;
-        int si = FaceToSolid(f);
+    for (int fi = 0; fi < (int)fFaces.size(); ++fi) {
+        int si = FaceToSolid(fFaces[fi].face);
         if (si < 0 || si >= (int)nSolids) {
-            // Unmapped face (should not happen): be conservative — no analytic Inside.
             for (auto& flag : analyticInsideOK) flag = 0;
             continue;
         }
         solidFaceIdx[si].push_back(fi);
-        const auto st = ownerSolid->fFaces[fi].surfType;
-        // Cone/Torus are handled in the parity path via the trim-exact OCCT per-face
-        // intersector (Phase A), so they no longer disqualify a solid from analytic
-        // (ray-parity) Inside(). Only a genuinely unhandled type (Other = BSpline/
-        // Bezier/Revolution/…) forces the whole solid onto BRepClass3d.
-        if (st == G4StepSolidImpl::FaceEntry::SurfType::Other) {
-            analyticInsideOK[si] = 0;  // unhandled surface → OCCT classifier for this solid
-        }
+        // Cone/Torus go through the trim-exact OCCT per-face intersector in the parity
+        // path (Phase A); only a genuinely unhandled type (Other) forces BRepClass3d.
+        if (fFaces[fi].surfType == FaceEntry::SurfType::Other)
+            analyticInsideOK[si] = 0;
     }
-    // A solid with zero registered faces (degenerate) must not use analytic Inside.
     for (size_t i = 0; i < nSolids; ++i)
         if (solidFaceIdx[i].empty()) analyticInsideOK[i] = 0;
 
     // --- CT-TRIM / CT-TRIM-2: build + self-validate the UV trim model per face ---
-    // BuildUVTrim tries a v-band model (CT-TRIM) and, for faces that are not a clean
-    // v-band (part_1's seam-notched full-2π cylinders), a general seam-aware polygon
-    // model (CT-TRIM-2). A model becomes .valid only on ZERO mismatch vs FClass2d;
-    // others keep .valid=false and the OCCT intersector path (no regression). Build is
-    // offline (per-thread, once) so its FClass2d cost is irrelevant to runtime navigation.
     {
-        const int nF = (int)ownerSolid->fFaces.size();
+        const int nF = (int)fFaces.size();
         faceUVTrim.resize(nF);
         int nValid = 0, nBand = 0, nPoly = 0;
         const bool uvOff = G4StepConfig::Get().uvTrimOff;  // A/B vs CT1
         for (int fi = 0; !uvOff && fi < nF; ++fi) {
-            faceUVTrim[fi] = ownerSolid->BuildUVTrim(ownerSolid->fFaces[fi], occtTol);
+            faceUVTrim[fi] = BuildUVTrim(fFaces[fi], occtTol);
             if (faceUVTrim[fi].valid) {
                 ++nValid;
-                if (faceUVTrim[fi].mode == UVTrim::Mode::Poly) ++nPoly; else ++nBand;
+                if (faceUVTrim[fi].mode == G4StepUVTrim::Mode::Poly) ++nPoly; else ++nBand;
             }
         }
         if (G4StepConfig::Get().uvTrimVerbose)
-            G4cout << "[CT-TRIM] " << ownerSolid->GetName() << ": "
+            G4cout << "[CT-TRIM] " << GetName() << ": "
                    << nValid << "/" << nF << " faces use UV trim ("
                    << nBand << " band, " << nPoly << " polygon)" << G4endl;
     }
 
     // --- CT-IN: per-solid parity-direction selection ---
-    // For each analytic solid, time a fixed set of candidate ray directions against
-    // its faces (using the prebuilt OCCT intersectors that the non-trim-safe faces
-    // will actually use) and keep the 4 fastest, fastest first. This sidesteps the
-    // OCCT IntCurvesFace_Intersector direction pathology on BSpline-trimmed cylinders.
-    // The candidate set is deterministic; the probe origins are deterministic too.
+    // Times a fixed candidate set against each solid's faces (via a TEMPORARY set of
+    // OCCT intersectors used only here) and keeps the 4 fastest. Sidesteps the
+    // IntCurvesFace_Intersector direction pathology on BSpline-trimmed cylinders.
     {
+        std::vector<IntCurvesFace_Intersector*> tmpInter;
+        tmpInter.reserve(fFaces.size());
+        for (const auto& fe : fFaces)
+            tmpInter.push_back(new IntCurvesFace_Intersector(fe.face, occtTol));
+
         solidParityDirs.assign(nSolids, {});
         // 14 well-spread unit directions (axis-ish + diagonals). Deterministic.
         static const double cand[][3] = {
@@ -424,7 +399,7 @@ G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolera
         for (size_t i = 0; i < nSolids; ++i) {
             if (!analyticInsideOK[i]) continue;
             // Solid bbox centroid + a few interior-ish probe origins.
-            Bnd_Box b; { for (int fi : solidFaceIdx[i]) b.Add(ownerSolid->fFaces[fi].bbox); }
+            Bnd_Box b; { for (int fi : solidFaceIdx[i]) b.Add(fFaces[fi].bbox); }
             if (b.IsVoid()) continue;
             double x0,y0,z0,x1,y1,z1; b.Get(x0,y0,z0,x1,y1,z1);
             gp_Pnt probes[3] = {
@@ -441,8 +416,8 @@ G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolera
                     gp_Lin ray(pr, gd);
                     for (int fi : solidFaceIdx[i]) {
                         // Only non-trim-safe faces incur the OCCT intersector cost.
-                        if (!ownerSolid->fFaces[fi].analyticTrimSafe)
-                            faceIntersectors[fi]->Perform(ray, -occtTol, kInfinity);
+                        if (!fFaces[fi].analyticTrimSafe)
+                            tmpInter[fi]->Perform(ray, -occtTol, kInfinity);
                     }
                 }
                 auto t1 = std::chrono::high_resolution_clock::now();
@@ -460,6 +435,7 @@ G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolera
                 G4cout << "[DIRSEL] solid#" << i << " best cand=" << cost[0].second
                        << " t=" << cost[0].first << "ns  worst t=" << cost.back().first << "ns" << G4endl;
         }
+        for (auto* p : tmpInter) delete p;   // timing-only intersectors; discard
     }
 
     static std::once_flag tolPrintFlag;
@@ -474,6 +450,30 @@ G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolera
         });
 }
 
+// Per-thread AlgoCache: build only the mutable OCCT objects + scratch. All read-only
+// geometry was built once by BuildSharedGeom and is read via owner (P2).
+G4StepSolidImpl::AlgoCache::AlgoCache(const G4StepSolidImpl* ownerImpl)
+    : owner(ownerImpl)
+{
+    for (TopExp_Explorer ex(owner->fShape, TopAbs_SOLID); ex.More(); ex.Next())
+        solidClassifiers.push_back(std::make_unique<BRepClass3d_SolidClassifier>(ex.Current()));
+
+    for (const auto& fe : owner->fFaces)
+        faceIntersectors.push_back(new IntCurvesFace_Intersector(fe.face, owner->occtTol));
+
+    for (const auto& fe : owner->fFaces) {
+        auto* dss = new BRepExtrema_DistShapeShape();
+        dss->LoadS2(fe.face);
+        faceExtrema.push_back(dss);
+    }
+
+    const size_t nFaces = owner->fFaces.size();
+    scratchHits.reserve(2 * nFaces);
+    scratchGroups.reserve(nFaces);
+    scratchInsideHits.reserve(2 * nFaces);
+    scratchFaceOrder.reserve(nFaces);
+}
+
 G4StepSolidImpl::AlgoCache::~AlgoCache() {
     for (auto* p : faceIntersectors) delete p;
     for (auto* p : faceExtrema)      delete p;
@@ -485,7 +485,7 @@ G4StepSolidImpl::AlgoCache::~AlgoCache() {
 G4StepSolidImpl::AlgoCache* G4StepSolidImpl::GetAlgo() const {
     AlgoCache* algo = fAlgoCache.Get();
     if (!algo) {
-        algo = new AlgoCache(fShape, fTolerance, this);
+        algo = new AlgoCache(this);
         fAlgoCache.Put(algo);
         std::lock_guard<std::mutex> lock(sAllCachesMutex);
         sAllCaches.push_back(algo);
@@ -514,7 +514,7 @@ G4StepSolidImpl::NearestFaceResult G4StepSolidImpl::NearestFace(const gp_Pnt& pt
     if (fFaces.empty()) return result;
 
     AlgoCache* algo = GetAlgo();
-    const G4double eps = algo->occtTol;
+    const G4double eps = occtTol;
 
     // OCCT fallback vertex shape — only constructed if at least one face
     // actually needs it (lazy, avoids MakeVertex when all faces are analytic).
@@ -656,7 +656,7 @@ G4double G4StepSolidImpl::RayCastToBoundary(const G4ThreeVector& p, const G4Thre
     if (validNorm) *validNorm = false;
 
     AlgoCache* algo = GetAlgo();
-    const G4double octTol = algo->occtTol;
+    const G4double octTol = occtTol;
     if (v.mag2() < octTol * octTol) return kInfinity;
 
     gp_Lin ray(G4toOCCT(p), gp_Dir(v.x(), v.y(), v.z()));
@@ -756,8 +756,8 @@ G4double G4StepSolidImpl::RayCastToBoundary(const G4ThreeVector& p, const G4Thre
 
     auto bandOf = [&](const HitGroup& g) -> G4double {
         const TopoDS_Face& f = !g.outFace.IsNull() ? g.outFace : g.anyFace;
-        int si = f.IsNull() ? -1 : algo->FaceToSolid(f);
-        return algo->SolidBand(si);
+        int si = f.IsNull() ? -1 : FaceToSolid(f);
+        return SolidBand(si);
     };
 
     auto isBoundaryGroup = [&](const HitGroup& g) -> bool {
@@ -942,7 +942,7 @@ static inline int CrossingNumberRing(const std::vector<double>& ru,
 //                 rings AND not inside any hole. Used for faces (part_1's full-2π
 //                 cylinders) whose outer trim carries a seam-crossing notch so a v-band
 //                 envelope is wrong near the seam.
-int G4StepSolidImpl::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) {
+int G4StepSolidImpl::ClassifyUVTrim(const G4StepUVTrim& t, double u, double v) {
     if (!t.valid) return -1;
     double uu = u;
     if (t.periodic) {
@@ -959,7 +959,7 @@ int G4StepSolidImpl::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double
         if (uu < t.u0 + t.band || uu > t.u1 - t.band) return -1; // near u-edge → defer
     }
 
-    if (t.mode == AlgoCache::UVTrim::Mode::Poly) {
+    if (t.mode == G4StepUVTrim::Mode::Poly) {
         // v outside the axial extent (with margin) → definitely off the face.
         if (v < t.v0 - t.band || v > t.v1 + t.band) return 0;
         // For a full-periodic Poly face the outer rings are closed in [u0,u1]×v (seam
@@ -1005,9 +1005,9 @@ int G4StepSolidImpl::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double
 // against BRepTopAdaptor_FClass2d on a dense UV grid. .valid is set true only when the
 // band reproduces OCCT's in/out classification with ZERO mismatch. Conservative by
 // design: any face that does not validate keeps .valid=false and is never accelerated.
-G4StepSolidImpl::AlgoCache::UVTrim
+G4StepUVTrim
 G4StepSolidImpl::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
-    AlgoCache::UVTrim t;
+    G4StepUVTrim t;
     // Only cylinder faces with a non-trivial (non-trim-safe) trim qualify.
     if (fe.surfType != FaceEntry::SurfType::Cylinder) return t;
     if (fe.analyticTrimSafe) return t;   // trim-safe faces already take the fast path
@@ -1033,7 +1033,7 @@ G4StepSolidImpl::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
     // sparse random sample reliably hits it. This is the safety net: a model that does not
     // validate keeps .valid=false and is never accelerated → correctness can't regress.
     BRepTopAdaptor_FClass2d fclass(face, 1e-9);
-    auto selfValidate = [&](AlgoCache::UVTrim& cand, const char* tag) -> int {
+    auto selfValidate = [&](G4StepUVTrim& cand, const char* tag) -> int {
         std::mt19937_64 rng(0x5UL * (uint64_t)(uintptr_t)&fe + 0x9E3779B97F4A7C15ULL);
         std::uniform_real_distribution<double> ru(u0, u1), rv(v0, v1);
         const int valN = dbg ? 20000 : 2000;
@@ -1122,8 +1122,8 @@ G4StepSolidImpl::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
             for (int b = 0; b < NB; ++b) if (top[b] < -1e299) { degenerate = true; break; }
         }
         if (!degenerate) {
-            AlgoCache::UVTrim band_t = t;
-            band_t.mode = AlgoCache::UVTrim::Mode::Band;
+            G4StepUVTrim band_t = t;
+            band_t.mode = G4StepUVTrim::Mode::Band;
             band_t.du = du; band_t.NB = NB;
             band_t.top = top; band_t.bot = bot;
             band_t.holeU = holeU; band_t.holeV = holeV;
@@ -1222,8 +1222,8 @@ G4StepSolidImpl::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
             else         { holeU.push_back(std::move(ru_)); holeV.push_back(std::move(rv_)); }
         }
         if (!buildFail && !outU.empty()) {
-            AlgoCache::UVTrim poly_t = t;
-            poly_t.mode = AlgoCache::UVTrim::Mode::Poly;
+            G4StepUVTrim poly_t = t;
+            poly_t.mode = G4StepUVTrim::Mode::Poly;
             poly_t.outU = outU; poly_t.outV = outV;
             poly_t.holeU = holeU; poly_t.holeV = holeV;
             poly_t.valid = true;
@@ -1278,9 +1278,9 @@ bool G4StepSolidImpl::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeV
         // analytic hits — no OCCT intersector. If ANY root is ambiguous (within the
         // boundary band), discard all analytic results for this face and defer the
         // whole face to the OCCT trim-exact intersector (preserves correctness).
-        const AlgoCache::UVTrim& tm =
-            (fi < (int)algo->faceUVTrim.size()) ? algo->faceUVTrim[fi]
-                                                : AlgoCache::UVTrim{};
+        const G4StepUVTrim& tm =
+            (fi < (int)faceUVTrim.size()) ? faceUVTrim[fi]
+                                                : G4StepUVTrim{};
         if (tm.valid && fe.surfType == FaceEntry::SurfType::Cylinder) {
             bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
             RaySurfCand cand[2];
@@ -1374,11 +1374,11 @@ EInside G4StepSolidImpl::InsideSolidAnalytic(int si, const G4ThreeVector& p,
                                          AlgoCache* algo, bool& ok) const
 {
     ok = true;
-    const std::vector<int>& faceIdx = algo->solidFaceIdx[si];
-    const G4double band = algo->SolidBand(si);
+    const std::vector<int>& faceIdx = solidFaceIdx[si];
+    const G4double band = SolidBand(si);
     // octTol is the global OCCT search/grouping window — reuse for hit grouping
     // so coincident hits at shared edges merge exactly as in the ray path.
-    const G4double octTol = algo->occtTol;
+    const G4double octTol = occtTol;
 
     // Deterministic ray directions: a primary axis-tilted dir, then perturbations.
     // Tilted away from axes to avoid systematically grazing axis-aligned planes.
@@ -1396,8 +1396,8 @@ EInside G4StepSolidImpl::InsideSolidAnalytic(int si, const G4ThreeVector& p,
     // (a fixed diagonal can be 50–250× slower than a good direction). Fall back
     // to the global kDirs if none were selected for this solid.
     const std::vector<G4ThreeVector>* solidDirs =
-        (si < (int)algo->solidParityDirs.size() && !algo->solidParityDirs[si].empty())
-        ? &algo->solidParityDirs[si] : nullptr;
+        (si < (int)solidParityDirs.size() && !solidParityDirs[si].empty())
+        ? &solidParityDirs[si] : nullptr;
     // Cap attempts: on these BSpline-trimmed solids each ray is expensive, so retry
     // only a couple of perturbations before deferring to the OCCT classifier — fewer
     // repeated slow rays trims the heavy tail without changing the result (the

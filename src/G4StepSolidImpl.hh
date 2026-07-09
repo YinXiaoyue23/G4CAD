@@ -105,6 +105,22 @@ struct G4StepTimingStats {
     int64_t insideFallbackCount = 0;
 };
 
+// CT-TRIM UV trim model for one face (read-only; built once, shared across threads).
+struct G4StepUVTrim {
+    bool   valid = false;
+    bool   periodic = false;
+    double u0 = 0, u1 = 0;
+    double v0 = 0, v1 = 0;
+    enum class Mode : uint8_t { Band = 0, Poly = 1 };
+    Mode   mode = Mode::Band;
+    double du = 0;
+    int    NB = 0;
+    std::vector<double> top, bot;
+    std::vector<std::vector<double>> holeU, holeV;
+    std::vector<std::vector<double>> outU, outV;
+    double band = 0;
+};
+
 // ====================================================================
 // G4StepSolidImpl — all of G4StepSolid's private state + worker methods.
 // The public G4StepSolid forwards its G4VSolid overrides here. fOwner is a
@@ -168,59 +184,43 @@ private:
     std::vector<FaceEntry> fFaces;
     std::vector<G4double>  fCumulativeArea;
 
-    // Thread-local OCCT algorithm objects
+    // --- Read-only geometry, built ONCE in the ctor (BuildSharedGeom) and SHARED
+    //     across all threads (P2). Per-thread AlgoCache reads these via its owner. ---
+    std::vector<Bnd_Box>           solidBoxes;      // per-solid enlarged bbox
+    std::vector<G4double>          solidTol;        // per-solid surface band
+    TopTools_DataMapOfShapeInteger faceSolidMap;    // face → owning solid index
+    G4double                       requestedTol = 1e-7;
+    G4double                       occtTol      = 1e-7;
+    bool                           perSolidTol  = true;
+    std::vector<std::vector<int>>  solidFaceIdx;    // CT-IN: faces per solid
+    std::vector<char>              analyticInsideOK;// CT-IN: solid uses ray parity?
+    std::vector<G4StepUVTrim>      faceUVTrim;      // CT-TRIM models (per global face)
+    std::vector<std::vector<G4ThreeVector>> solidParityDirs;  // per-solid fast dirs
+    void     BuildSharedGeom();                     // build the above once (ctor, master thread)
+    int      FaceToSolid(const TopoDS_Face& f) const;
+    G4double SolidBand(int si) const {
+        if (perSolidTol && si >= 0 && si < (int)solidTol.size()) return solidTol[si];
+        return requestedTol;
+    }
+
+    // Per-thread OCCT algorithm objects (mutable Perform state) + scratch buffers.
     struct AlgoCache {
         std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> solidClassifiers;
-        std::vector<Bnd_Box>                                       solidBoxes;
-        std::vector<IntCurvesFace_Intersector*>                    faceIntersectors;
-        std::vector<BRepExtrema_DistShapeShape*>                   faceExtrema;
+        std::vector<IntCurvesFace_Intersector*>                   faceIntersectors;
+        std::vector<BRepExtrema_DistShapeShape*>                  faceExtrema;
 
-        std::vector<G4double>          solidTol;
-        TopTools_DataMapOfShapeInteger faceSolidMap;
-        G4double                       requestedTol = 1e-7;
-        G4double                       occtTol      = 1e-7;
-        bool                           perSolidTol  = true;
-
-        std::vector<std::vector<int>>  solidFaceIdx;
-        std::vector<char>              analyticInsideOK;
-
-        struct UVTrim {
-            bool   valid = false;
-            bool   periodic = false;
-            double u0 = 0, u1 = 0;
-            double v0 = 0, v1 = 0;
-            enum class Mode : uint8_t { Band = 0, Poly = 1 };
-            Mode   mode = Mode::Band;
-            double du = 0;
-            int    NB = 0;
-            std::vector<double> top, bot;
-            std::vector<std::vector<double>> holeU, holeV;
-            std::vector<std::vector<double>> outU, outV;
-            double band = 0;
-        };
-        std::vector<UVTrim>            faceUVTrim;
-        int64_t                       uvTrimAccept = 0;
-        int64_t                       uvTrimBandFallback = 0;
-
-        std::vector<std::vector<G4ThreeVector>> solidParityDirs;
-        std::vector<RayHit>            scratchInsideHits;
+        std::vector<RayHit>                scratchHits;
+        std::vector<HitGroup>              scratchGroups;
+        std::vector<RayHit>                scratchInsideHits;
         std::vector<std::pair<double,int>> scratchFaceOrder;
 
+        int64_t                uvTrimAccept = 0;
+        int64_t                uvTrimBandFallback = 0;
         TimingStats            timing;
         const G4StepSolidImpl* owner = nullptr;
 
-        std::vector<RayHit>   scratchHits;
-        std::vector<HitGroup> scratchGroups;
-
-        AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
-                  const G4StepSolidImpl* ownerImpl);
+        explicit AlgoCache(const G4StepSolidImpl* ownerImpl);
         ~AlgoCache();
-
-        int      FaceToSolid(const TopoDS_Face& f) const;
-        G4double SolidBand(int si) const {
-            if (perSolidTol && si >= 0 && si < (int)solidTol.size()) return solidTol[si];
-            return requestedTol;
-        }
     };
 
     mutable G4Cache<AlgoCache*> fAlgoCache;
@@ -257,8 +257,8 @@ private:
     bool IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
                                 const G4ThreeVector& dir, G4double octTol,
                                 std::vector<RayHit>& hits) const;
-    AlgoCache::UVTrim BuildUVTrim(const FaceEntry& fe, G4double octTol) const;
-    static int ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v);
+    G4StepUVTrim BuildUVTrim(const FaceEntry& fe, G4double octTol) const;
+    static int ClassifyUVTrim(const G4StepUVTrim& t, double u, double v);
     EInside InsideSolidAnalytic(int si, const G4ThreeVector& p,
                                 AlgoCache* algo, bool& ok) const;
     G4ThreeVector GetNormalAtIntersection(const TopoDS_Face& face, G4double u, G4double v) const;
