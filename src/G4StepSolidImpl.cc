@@ -84,6 +84,58 @@ namespace {
             m = std::max(m, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
         return m;
     }
+
+    // ================================================================
+    // Analytic ray-surface intersection cores (P1: single shared impl)
+    // ----------------------------------------------------------------
+    // These reproduce the EXACT math previously inlined in both
+    // RayCastToBoundary and IntersectFaceForParity, so Inside() and
+    // DistanceToIn/Out() cannot drift apart. They are pure geometry:
+    // root solve + t>=-tol + r>0 + transition (incl. tangent degeneracy)
+    // + (u,v). They do NOT touch timing counters and do NOT apply the
+    // CT-TRIM band classification — those stay in the callers. The ray is
+    // passed as origin (o*) + direction (d*) so both the RayCast `v`
+    // (possibly non-unit) and the parity `dir` (unit) callers work; A/nv
+    // are always computed from the passed components (never hardcoded).
+    struct RaySurfCand {
+        G4double                          t;
+        IntCurveSurface_TransitionOnCurve trans;
+        G4double                          u, v;
+    };
+
+    // Ray vs rectangular-trimmed plane. Returns 0 or 1. The UV-rectangle
+    // trim is identical in both call sites (and there is no CT-TRIM plane
+    // variant), so it is folded in here.
+    inline int RayIntersectPlane(const gp_Ax3& ax,
+                                 G4double u0, G4double u1, G4double v0, G4double v1,
+                                 bool fwd,
+                                 G4double ox, G4double oy, G4double oz,
+                                 G4double dx, G4double dy, G4double dz,
+                                 G4double tol, RaySurfCand out[1])
+    {
+        const gp_Dir& nm  = ax.Direction();
+        const gp_Pnt& loc = ax.Location();
+        G4double nv = nm.X()*dx + nm.Y()*dy + nm.Z()*dz;
+        if (std::abs(nv) < 1e-15) return 0;
+        G4double np = nm.X()*(ox-loc.X()) + nm.Y()*(oy-loc.Y()) + nm.Z()*(oz-loc.Z());
+        G4double t = -np / nv;
+        if (t < -tol) return 0;
+        G4double hx = ox+t*dx-loc.X();
+        G4double hy = oy+t*dy-loc.Y();
+        G4double hz = oz+t*dz-loc.Z();
+        const gp_Dir& xu = ax.XDirection();
+        const gp_Dir& yv = ax.YDirection();
+        G4double uf = xu.X()*hx + xu.Y()*hy + xu.Z()*hz;
+        G4double vf = yv.X()*hx + yv.Y()*hy + yv.Z()*hz;
+        if (uf < u0-tol || uf > u1+tol || vf < v0-tol || vf > v1+tol) return 0;
+        G4double n_out_v = fwd ? nv : -nv;
+        IntCurveSurface_TransitionOnCurve trans;
+        if      (n_out_v < -tol) trans = IntCurveSurface_In;
+        else if (n_out_v >  tol) trans = IntCurveSurface_Out;
+        else                     trans = IntCurveSurface_Tangent;
+        out[0] = { t, trans, uf, vf };
+        return 1;
+    }
 } // namespace
 
 // ====================================================================
@@ -501,34 +553,13 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 
         // ─── Plane (rectangular only; circle/annulus trim falls back to OCCT) ──
         if (fe.surfType == FaceEntry::SurfType::Plane && fe.isRectPlane) {
-            const gp_Ax3& ax  = fe.pos;
-            const gp_Dir& nm  = ax.Direction();
-            const gp_Pnt& loc = ax.Location();
-            double nv = dot3(nm.X(),nm.Y(),nm.Z(), v.x(),v.y(),v.z());
-            if (std::abs(nv) >= 1e-15) {
-                double np = dot3(nm.X(),nm.Y(),nm.Z(),
-                                 p.x()-loc.X(), p.y()-loc.Y(), p.z()-loc.Z());
-                double t = -np / nv;
-                if (t >= -octTol) {
-                    double hx = p.x()+t*v.x()-loc.X();
-                    double hy = p.y()+t*v.y()-loc.Y();
-                    double hz = p.z()+t*v.z()-loc.Z();
-                    const gp_Dir& xu = ax.XDirection();
-                    const gp_Dir& yv = ax.YDirection();
-                    double uf = dot3(xu.X(),xu.Y(),xu.Z(), hx,hy,hz);
-                    double vf = dot3(yv.X(),yv.Y(),yv.Z(), hx,hy,hz);
-                    if (uf >= fe.u0-octTol && uf <= fe.u1+octTol &&
-                        vf >= fe.v0-octTol && vf <= fe.v1+octTol) {
-                        bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
-                        double n_out_v = fwd ? nv : -nv;
-                        IntCurveSurface_TransitionOnCurve trans;
-                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                        else                        trans = IntCurveSurface_Tangent;
-                        rawHits.emplace_back(t, trans, fe.face, uf, vf);
-                        if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
-                    }
-                }
+            bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+            RaySurfCand cand[1];
+            int nc = RayIntersectPlane(fe.pos, fe.u0, fe.u1, fe.v0, fe.v1, fwd,
+                                       p.x(),p.y(),p.z(), v.x(),v.y(),v.z(), octTol, cand);
+            for (int c = 0; c < nc; ++c) {
+                rawHits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
+                if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
             }
             analytic = true;
             if (fTimingEnabled) ++algo->timing.rayAnalyticCount;
@@ -1298,34 +1329,12 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
 
     // ─── Plane (rectangular trim → UV box exact) ───────────────────────────
     if (fe.surfType == FaceEntry::SurfType::Plane) {
-        const gp_Ax3& ax  = fe.pos;
-        const gp_Dir& nm  = ax.Direction();
-        const gp_Pnt& loc = ax.Location();
-        double nv = dot3(nm.X(),nm.Y(),nm.Z(), dir.x(),dir.y(),dir.z());
-        if (std::abs(nv) >= 1e-15) {
-            double np = dot3(nm.X(),nm.Y(),nm.Z(),
-                             p.x()-loc.X(), p.y()-loc.Y(), p.z()-loc.Z());
-            double t = -np / nv;
-            if (t >= -octTol) {
-                double hx = p.x()+t*dir.x()-loc.X();
-                double hy = p.y()+t*dir.y()-loc.Y();
-                double hz = p.z()+t*dir.z()-loc.Z();
-                const gp_Dir& xu = ax.XDirection();
-                const gp_Dir& yv = ax.YDirection();
-                double uf = dot3(xu.X(),xu.Y(),xu.Z(), hx,hy,hz);
-                double vf = dot3(yv.X(),yv.Y(),yv.Z(), hx,hy,hz);
-                if (uf >= fe.u0-octTol && uf <= fe.u1+octTol &&
-                    vf >= fe.v0-octTol && vf <= fe.v1+octTol) {
-                    bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
-                    double n_out_v = fwd ? nv : -nv;
-                    IntCurveSurface_TransitionOnCurve trans;
-                    if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                    else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                    else                        trans = IntCurveSurface_Tangent;
-                    hits.emplace_back(t, trans, fe.face, uf, vf);
-                }
-            }
-        }
+        bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+        RaySurfCand cand[1];
+        int nc = RayIntersectPlane(fe.pos, fe.u0, fe.u1, fe.v0, fe.v1, fwd,
+                                   p.x(),p.y(),p.z(), dir.x(),dir.y(),dir.z(), octTol, cand);
+        for (int c = 0; c < nc; ++c)
+            hits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
         return true;
     }
 
