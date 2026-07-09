@@ -163,9 +163,19 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
 
 G4StepSolid::~G4StepSolid() {
     delete fpPolyhedron;
+    // Free ONLY this solid's per-thread AlgoCaches. sAllCaches is a process-wide
+    // registry shared by every G4StepSolid instance (and read by the timing
+    // aggregation, which already filters by owner). The old code deleted and cleared
+    // the WHOLE registry here, so destroying one solid freed every other live solid's
+    // caches, leaving their fAlgoCache G4Cache holding dangling pointers → UAF. Delete
+    // only entries owned by `this` and compact the survivors back into the registry.
     std::lock_guard<std::mutex> lock(sAllCachesMutex);
-    for (AlgoCache* c : sAllCaches) delete c;
-    sAllCaches.clear();
+    auto keep = sAllCaches.begin();
+    for (AlgoCache* c : sAllCaches) {
+        if (c->owner == this) delete c;
+        else                  *keep++ = c;
+    }
+    sAllCaches.erase(keep, sAllCaches.end());
 }
 
 G4StepSolid::G4StepSolid(const G4StepSolid& rhs)
