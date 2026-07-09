@@ -414,3 +414,240 @@ All five issues were resolved.  After all fixes (10 000-event runs):
 **Step-count inflation — root cause and fix.**  `G4StepSolid::DistanceToOut(p)` was returning 0 for 100 % of interior points because `NearestFace()` reused a single `BRepExtrema_DistShapeShape` object across all faces via `LoadS2`, and OCCT's stale internal state from the first face poisoned all subsequent face queries.  The geantino control test confirmed the inflation was exclusively MSC-driven (geantino: native = STEP = 3 steps; electron: was 4–6× inflated).
 
 The fix — constructing a fresh `BRepExtrema_DistShapeShape(vtxShape, face)` per face — completely resolved the issue.  Safety now matches native to < 0.001 % across all 550 sampled interior points per geometry, and step counts are statistically indistinguishable from native analytic solids.
+
+---
+
+## 7. box_hole Edep gap — definitive root cause (2026-07-02)
+
+§6 attributed the residual box\_hole energy-deposition gap to "`G4SubtractionSolid`
+safety underestimation near the hole rim." A rigorous native-vs-step step-trace
+investigation supersedes that description: the gap is **not** a solid-query error
+at all. This section records the definitive root cause and the decision to accept
+the gap.
+
+### 7.1 Symptom (current)
+
+At 5 000 events, box\_hole edep: native = 9.628 ± 0.013 MeV, step = 9.537 ± 0.013 MeV.
+Gap = **0.091 MeV ≈ 0.95 %, ≈ 5 σ** (real, systematic). Step-mode tracks are
+*longer* (492 vs 446 mm) yet deposit *less* energy and take *fewer* steps
+(24.8 vs 27.1) — energy is carried out of the material rather than deposited.
+
+### 7.2 Mechanism — `fBlockedPhysicalVolume` ghost steps
+
+The benchmark gun is deterministic (e⁻, 10 MeV, fixed position (30,0,−200), +z) and
+the seed is fixed (42), so event *N* is step-for-step identical between native and
+step until geometry navigation first diverges. Tracing confirms the loss sequence:
+
+1. An electron diffuses (MSC) to the cylindrical hole wall and **exits the solid
+   into the hole** at r ≈ 20 mm (a clean geometry-boundary step, `post_stat=Geom`).
+2. Geant4's navigator marks the just-exited volume `fBlockedPhysicalVolume` — it is
+   blocked from re-entry for exactly **one** step (a convex-solid optimisation).
+3. The next step is therefore **physics-limited** (`post_stat=Physics`): with the
+   solid blocked, `DistanceToIn` is *not* consulted, the only geometry boundary is
+   the distant World, and MSC takes a large step (tens–hundreds of mm) that
+   traverses solid Si **as if it were vacuum** — depositing ≈ 0. This is the
+   "ghost step."
+4. Depending on where the ghost step ends, the particle either re-enters (recovered
+   by the DistanceToIn Inside-check, commit a5c8498) or escapes the box entirely
+   (500-event run: 33 escapes for step vs 8 for native).
+
+### 7.3 The solid is not at fault — every query matches native
+
+All `G4StepSolid` responses the navigator can query were compared to native
+G4SubtractionSolid at the exact wall configuration:
+
+| Query | native vs step |
+|---|---|
+| Isotropic safety at wall (`GetSafety`) | both 0 |
+| `Inside()` classification (20 000-pt grid + wall points) | 0 mismatches |
+| `DistanceToOut(p,v)` toward hole (20 000 pts) | max 3.5 × 10⁻¹⁵ mm |
+| Isotropic safety `DistanceToOut(p)` | ratio = 1.0 (identical means) |
+| `DistanceToIn/Out(p,v)` (nav-test, 50 000 rays) | 0 mismatch, ≤ 4.5 × 10⁻¹³ mm |
+
+The solid matches native to machine precision on every path *listed above*. The
+ghost step arises from the navigator's one-step blocking of a single **concave**
+BREP solid, which native (a boolean composition) suffers ≈ 4× less often (26 vs 6
+qualifying ghost steps / 500 events). §7.3 originally concluded this difference was
+"not expressible through the `G4VSolid` interface" — that was **wrong**: the table
+above omitted one interface output, the *exit-normal validity flag* returned by
+`DistanceToOut(p, v, calcNorm=true, &validNorm, &n)`. That flag was the sole
+differentiator, and it is fixable (see §7.6).
+
+### 7.4 A genuine latent bug found and fixed (commit 27b30bb)
+
+The investigation surfaced one real `DistanceToIn(p,v)` bug via a dedicated
+wall-crossing probe: for a point **inside** the solid (r = R+ε near the concave
+wall) heading across the hole, step returned the far-wall re-entry distance
+(~40 mm) instead of **0**. Native returns 0 (Geant4 convention). Fixed in
+`RayCastToBoundary`: the first forward net-crossing being an *Exit* means p is
+inside ⇒ return 0. All correctness gates still pass.
+
+However, this fix leaves the box\_hole edep **byte-identical**: during the blocked
+ghost step the solid is blocked, so `DistanceToIn` is never called there. The fix
+is a latent-correctness improvement, effective only in combination with a mechanism
+that shortens the blocked step (a `G4UserLimits` max-step cap would clear the block
+early and let the corrected `DistanceToIn` re-enter immediately).
+
+### 7.5 First (premature) conclusion — superseded by §7.6
+
+An initial reading concluded the gap was an *inherent, unfixable* limitation of
+navigating a single concave BREP solid, addressable only by a global max-step cap.
+**That conclusion was wrong** and is retained here only as a record of the
+investigation. Continued digging into `G4Navigator`'s source (§7.6) found the exact
+trigger — an interface output the §7.3 table had not compared — and it is fixable
+in G4StepSolid.
+
+### 7.6 Root cause and fix — exit-normal validity flag (commit 0ab3e3e)
+
+**Trigger (from Geant4 source + controlled navigator experiment).**
+`G4NormalNavigation::ComputeStep` applies an *exit-block* optimisation: after a
+track exits a daughter **through a valid exit normal**
+(`localDirection.dot(exitNormal) >= kMinExitingNormalCosine`), that daughter is
+skipped for one step to avoid immediate re-entry. This is sound only for a locally
+convex exit. At the concave hole wall the track *does* re-enter (across the cavity),
+so skipping it produces the ghost step.
+
+A controlled experiment drove a real `G4Navigator` through the exit→relocate→step
+sequence with **identical** start configs for native and step. Every solid output
+was identical — exit-normal *vector* `(-1,0,0)`, `Inside` = kSurface, `SurfaceNormal`,
+`DistanceToIn/Out` values, and the solid tolerance (swept 1e-7 → 1e-11, no effect) —
+**except one**: the `validNorm` flag from `DistanceToOut(..., calcNorm=true, ...)`.
+
+| | exit-normal vector | **validNorm** | next step |
+|---|---|---|---|
+| native G4SubtractionSolid | (-1, 0, 0) | **false** | 41.8 mm (re-enters) |
+| step G4StepSolid (pre-fix) | (-1, 0, 0) | **true** | 334 mm (**ghost**) |
+
+Native returns `validNorm=false` at the subtracted (concave) surface, which
+disables the optimisation; G4StepSolid confidently returned `true`, enabling the
+unsafe block. That flag alone flipped re-enter vs ghost.
+
+**Fix.** In `RayCastToBoundary`'s `DistanceToOut` path, report the exit normal as
+**invalid** when the ray has a further net-*Entry* crossing beyond the exit — i.e.
+the ray re-enters the solid. This reuses the hit groups already computed for the
+exit distance (no extra ray cast) and is direction-precise; convex exits (no
+re-entry ahead) keep `validNorm=true`, preserving the navigator optimisation.
+
+**Result (box_hole, 5000 ev, single-thread, reproducible):**
+
+| | native | step | gap |
+|---|---|---|---|
+| before | 9.6280 | 9.5369 | −0.091 MeV (**5 σ**) |
+| after (0ab3e3e) | 9.6280 | 9.6467 | +0.019 MeV (**1.0 σ**, ≈ 0) |
+
+Step track length 491.7 → 434.1 mm (ghost travel eliminated; native 446.5). Native
+edep byte-identical before/after (fix touches only G4StepSolid). All gates still
+pass: nav-test 0 mismatch / max_dev_in ≤ 4.5×10⁻¹³ mm on 5 geometries; safety
+ratio = 1; cross-section 0/250000; convex geometries (box/sphere/cylinder/touching)
+edep unchanged within noise.
+
+**Decision (2026-07-02): the box_hole edep gap is closed by commit 0ab3e3e.** The
+DistanceToIn Inside-check (27b30bb) is retained; it is the necessary partner — once
+the block is lifted, `DistanceToIn` at the mis-located interior point must return 0
+for a clean immediate re-entry.
+
+### 7.7 Open item — step-count residual and the MSC step-size question (not yet verified)
+
+Two loose ends remain after the fix. Neither affects the scalar physics results
+verified above, but both are worth closing when time permits.
+
+**Observations.**
+- box_hole STEP now takes ~30 % *more* steps than native (32.7 vs 27.1) and is
+  ~20 % slower (1.35 s vs 1.11 s, 5000 ev / 1 thread). This is *not* a regression:
+  the pre-fix low count (24.8) was itself an artifact — the ghost step teleported
+  through the material, skipping the steps (and the energy) it should have taken.
+  The fix exposes the honest, higher count. Verified this is NOT caused by the
+  27b30bb DistanceToIn=0 micro-steps: temporarily returning the far-wall distance
+  instead of 0 left the step count unchanged (32.7). It is the genuine BREP
+  traversal of the concave region.
+- sphere STEP also takes ~+5 steps and shows a boundary-crossing excess — a
+  *separate*, convex-geometry residual, most likely the OCCT sphere pole/seam
+  (degenerate BREP points). Cylinder (curved, no poles) matches native; box /
+  touching (planar) match. So the step residual tracks "hard" features:
+  concave holes and poles.
+
+**Why edep-match alone is not full proof.** Matching *total* edep (a scalar) and
+*total* track length is necessary but not sufficient — two runs can agree on
+integrals while differing in the spatial distribution. The strong correctness
+argument is geometric fidelity (nav-test 1e-13, Inside 0-mismatch, safety, volume):
+Geant4 physics = (physics list) × (geometry queries), and both are proven identical,
+so the particle samples the same material everywhere. The **one genuine residual
+risk** is that Geant4 condensed-history **MSC is not perfectly step-size
+independent** — taking ~30 % more steps could, in principle, leak a small physics
+difference through MSC. The matching total edep *and* track length bound it to be
+small (and most extra steps are in the vacuum hole, where MSC is inert), but it has
+not been *directly* checked.
+
+**Verification method to close it (differential observables).** Add a temporary
+recorder in `SteppingAction` (self-contained: file-static histograms dumped at exit
+to `$G4CAD_DIFF_OUT`, keyed per run; run single-thread for reproducibility) that
+accumulates, for the primary and its shower:
+1. **Longitudinal edep profile** — edep vs z (step midpoint), 40 bins over [−100,100].
+2. **Transverse edep profile** — edep vs transverse distance from the beam axis
+   (x=30, y=0), i.e. √((x−30)²+y²), 30 bins over [0,60] — the MSC lateral-spread
+   observable.
+3. **Primary exit angle** — cos θ of the primary's final momentum vs the +z launch
+   direction, recorded when `GetTrackStatus() != fAlive`, 40 bins over [−1,1] — the
+   most MSC-sensitive observable.
+Run native and STEP at high stats (≥20 000 ev), compare the three histograms.
+**Pass criterion:** all three differential distributions agree within Poisson
+statistics. If they do, the step-count difference is confirmed purely cosmetic and
+the simulation is verified at the differential level; if the transverse profile or
+cos θ disagree, MSC step-dependence is real and step-limiting (`G4UserLimits` /
+range factor) would need tuning. (A draft of this recorder was written and reverted
+on 2026-07-03; not yet run.)
+
+## 8. Open item — Roman Pot (RP.step) stuck-track warnings (deferred)
+
+> **[2026-07-09 RESOLVED — root cause found, fixed dev `ebc63a3`]** The "grazing /
+> thin-wall / near-coincident" hypothesis below was **disproven** by evidence. Actual
+> root cause: `DistanceToIn(p,v)` returned 0 for a point on the surface band whenever
+> the nearest forward crossing was there, without checking crossing direction — so a
+> track sitting on the boundary *leaving* the solid (exit crossing, net<0) was told it
+> could re-enter at distance 0, driving the solid↔world oscillation. Evidence over 124
+> recorded stuck points: 0/124 kInside, DistanceToIn=DistanceToOut=0 for all, grazing
+> only 1/124, and ground-truth stepping shows 107/124 are "on-surface moving OUT".
+> Fix (two commits): (1) `ebc63a3` — on-surface returns 0 only for an ENTRY crossing
+> (net>0); exit crossings skipped (132→8). (2) `64add04` — the "first-forward-Exit
+> beyond band ⇒ p inside ⇒ 0" heuristic (originally the box_hole edep fix) now fires
+> only when `Inside(p)==kInside`; on-surface-leaving points (kSurface) are not treated
+> as inside (8→0). Final: RP stuck **132→0** at 200 and 1000 events, run exit 0;
+> 5-geometry gates byte-identical (zero regression); box_hole edep vs native 0.13σ
+> (edep fix preserved). See `architecture_review.md` §12.5. Historical analysis below
+> kept for the record.
+
+The realistic ALADDIN Roman Pot CAD assembly (`share/example/RP.step`, 13 solids,
+474 faces, planes/cylinders/cones/tori) imports and simulates to completion, but a
+2000-event e⁻ run produces ~1133 Geant4 "stuck-track" self-recovery warnings
+(≈57% of events). Diagnosed 2026-07-06/07:
+
+- **Not a volumetric overlap.** 2×10⁶ random points in the global bbox: **zero**
+  points inside ≥2 solids. The 13 components do not interpenetrate; the CAD is
+  geometrically sound. (Bounding boxes overlap heavily — thin-walled nested
+  parts — but that is bbox, not material.)
+- A few adjacent solids nearly touch: solids 5&12 and 6&12 at ~−0.03 mm; 3&6,
+  4&5 at ~+0.5 mm.
+- Stuck-track oscillation is always `solid ↔ world` (never `solid_A ↔ solid_B`),
+  spread across many solids' own BREP surfaces (e.g. step_part_2 at the r≈40 mm
+  cylinder near z≈−183; step_part_12 at the z=−12 plane). This is a **G4StepSolid
+  boundary-navigation robustness issue** (grazing / thin-wall / near-coincident
+  surfaces), same family as the box_hole navigation work but a different symptom
+  (oscillation, not ghost-step). Geant4's "Likely geometry overlap" text is only
+  its default guess when a track fails to advance — it does not imply a real
+  overlap.
+- **Surface tolerance band is NOT the cause.** RP faces have tight tolerance
+  (1e-7 mm) but edges are loose (max 24.8 µm), inflating the per-solid band to
+  ~0.05 mm via `ShapeNoise` (max over faces+edges+vertices). Rebuilding with
+  `ShapeNoise` restricted to faces only (band → 2e-7 mm) left the stuck-track
+  count byte-identical (1133) — refuted.
+
+All events complete; physics quantities are stable; the push (1 nm) self-recovers
+every case. For the paper this is reported as "imports and navigates to completion
+with self-recovering navigation warnings," not as a zero-warning production
+geometry.
+
+**To resolve (deferred, high effort):** isolate the dominant stuck configuration
+(grazing vs thin-wall vs near-coincident) with a targeted probe as done for
+box_hole, then improve `DistanceToIn/Out` so a track near a surface always makes a
+minimum meaningful step. Geant4-level mitigations that need no G4CAD change:
+`G4UserLimits` max-step + `G4StepLimiter`, or a larger navigator push tolerance.

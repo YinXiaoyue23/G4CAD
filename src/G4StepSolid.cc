@@ -1,4 +1,6 @@
 #include "G4StepSolid.hh"
+#include "G4StepSolidImpl.hh"
+#include "G4StepConfig.hh"
 #include "G4SystemOfUnits.hh"
 #include "G4VoxelLimits.hh"
 #include "G4AffineTransform.hh"
@@ -13,6 +15,7 @@
 #include "G4EventManager.hh"
 #include "G4TrackingManager.hh"
 #include "G4Track.hh"
+#include "G4GeometryTolerance.hh"
 
 // OCCT Headers
 #include <TopoDS.hxx>
@@ -57,16 +60,21 @@ namespace {
 // ====================================================================
 // Static member definitions
 // ====================================================================
-std::vector<G4StepSolid::AlgoCache*>    G4StepSolid::sAllCaches;
-std::mutex                               G4StepSolid::sAllCachesMutex;
+std::vector<G4StepSolidImpl::AlgoCache*>    G4StepSolidImpl::sAllCaches;
+std::mutex                               G4StepSolidImpl::sAllCachesMutex;
+
+std::vector<const G4StepSolidImpl*>  G4StepSolidImpl::sTimedSolids;
+std::mutex                               G4StepSolidImpl::sTimedSolidsMutex;
+std::once_flag                           G4StepSolidImpl::sAtexitFlag;
 
 // Query recorder (debug-only)
-bool           G4StepSolid::sRecordEnabled   = false;
-int            G4StepSolid::sRecordOnlyEvent = -1;
-std::ofstream  G4StepSolid::sRecordStream;
-std::mutex     G4StepSolid::sRecordMutex;
-std::once_flag G4StepSolid::sRecordInitFlag;
-long           G4StepSolid::sRecordSeq       = 0;
+bool           G4StepSolidImpl::sRecordEnabled   = false;
+int            G4StepSolidImpl::sRecordOnlyEvent = -1;
+bool           G4StepSolidImpl::sInsideForceOCCT = false;
+std::ofstream  G4StepSolidImpl::sRecordStream;
+std::mutex     G4StepSolidImpl::sRecordMutex;
+std::once_flag G4StepSolidImpl::sRecordInitFlag;
+long           G4StepSolidImpl::sRecordSeq       = 0;
 
 // ====================================================================
 // Query recorder (debug-only)
@@ -79,17 +87,16 @@ namespace {
     }
 }
 
-void G4StepSolid::InitRecorderOnce() {
-    const char* path = std::getenv("G4CAD_RECORD");
-    if (!path || !*path) { sRecordEnabled = false; return; }
+void G4StepSolidImpl::InitRecorderOnce() {
+    const std::string& path = G4StepConfig::Get().recordPath;
+    if (path.empty()) { sRecordEnabled = false; return; }
     sRecordStream.open(path, std::ios::out | std::ios::trunc);
     if (!sRecordStream.is_open()) {
         G4cerr << "[G4StepSolid] G4CAD_RECORD set but cannot open " << path << G4endl;
         sRecordEnabled = false;
         return;
     }
-    const char* evEnv = std::getenv("G4CAD_RECORD_EVENT");
-    sRecordOnlyEvent = (evEnv && *evEnv) ? std::atoi(evEnv) : -1;
+    sRecordOnlyEvent = G4StepConfig::Get().recordEvent;
     sRecordStream << "seq,event,trackid,parentid,type,px,py,pz,vx,vy,vz,"
                   << "result,dist,inside_at_p,solid\n";
     sRecordEnabled = true;
@@ -99,7 +106,7 @@ void G4StepSolid::InitRecorderOnce() {
     G4cout << G4endl;
 }
 
-void G4StepSolid::RecordQuery(QueryType type, const G4ThreeVector& p,
+void G4StepSolidImpl::RecordQuery(QueryType type, const G4ThreeVector& p,
                               const G4ThreeVector& v, int insideResult,
                               G4double dist, int insideAtP) const {
     if (!sRecordEnabled) return;
@@ -137,25 +144,34 @@ void G4StepSolid::RecordQuery(QueryType type, const G4ThreeVector& p,
 // ====================================================================
 // Construction and destruction
 // ====================================================================
-G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
-                          G4double tolerance)
-    : G4VSolid(name), fShape(stepShape), fTolerance(tolerance)
+G4String G4StepSolidImpl::GetName() const { return fOwner->GetName(); }
+
+G4StepSolidImpl::G4StepSolidImpl(const TopoDS_Shape& stepShape, G4double tolerance,
+                                 G4StepSolid* owner)
+    : fOwner(owner), fShape(stepShape), fTolerance(tolerance),
+      kCarTolerance(G4GeometryTolerance::GetInstance()->GetSurfaceTolerance())
 {
     // Resolve the debug query recorder once (reads G4CAD_RECORD env); zero cost when off.
-    // Per-solid tolerances are computed lazily per thread in AlgoCache (keeps ABI stable).
-    std::call_once(sRecordInitFlag, &G4StepSolid::InitRecorderOnce);
+    std::call_once(sRecordInitFlag, &G4StepSolidImpl::InitRecorderOnce);
+
+    // CT-IN differential test gate (centralised in G4StepConfig, read once).
+    if (G4StepConfig::Get().insideForceOCCT) sInsideForceOCCT = true;
 
     CalcBBox();
     BuildFaceWeights();
+    BuildSharedGeom();   // P2: build the read-only, thread-shared geometry ONCE here
+                         // (master thread) instead of per-thread in each AlgoCache.
+
+    // Enable per-call timing when G4CAD_TIMER is set; zero overhead otherwise.
+    if (G4StepConfig::Get().timing) SetTimingEnabled(true);
 }
 
-G4StepSolid::~G4StepSolid() {
+G4StepSolidImpl::~G4StepSolidImpl() {
     delete fpPolyhedron;
     // Free ONLY this solid's per-thread AlgoCaches. sAllCaches is a process-wide
-    // registry shared by every G4StepSolid instance. The old code deleted and cleared
-    // the WHOLE registry here, so destroying one solid freed every other live solid's
-    // caches, leaving their fAlgoCache G4Cache holding dangling pointers → UAF. Delete
-    // only entries owned by `this` and compact the survivors back into the registry.
+    // registry shared by every solid (and read by the timing aggregation, which
+    // filters by owner). Deleting the whole registry here would free other live
+    // solids' caches → UAF. Delete only entries owned by `this` and compact the rest.
     std::lock_guard<std::mutex> lock(sAllCachesMutex);
     auto keep = sAllCaches.begin();
     for (AlgoCache* c : sAllCaches) {
@@ -165,56 +181,32 @@ G4StepSolid::~G4StepSolid() {
     sAllCaches.erase(keep, sAllCaches.end());
 }
 
-G4StepSolid::G4StepSolid(const G4StepSolid& rhs)
-    : G4VSolid(rhs), fVerboseLevel(rhs.fVerboseLevel),
+// Deep-copy geometry for a copied G4StepSolid; the per-thread AlgoCache is NOT
+// copied (fresh empty G4Cache; GetAlgo rebuilds lazily with the new owner).
+G4StepSolidImpl::G4StepSolidImpl(const G4StepSolidImpl& rhs, G4StepSolid* owner)
+    : fOwner(owner),
+      fVerboseLevel(rhs.fVerboseLevel), fTimingEnabled(rhs.fTimingEnabled),
       fShape(rhs.fShape),
       fXmin(rhs.fXmin), fXmax(rhs.fXmax),
       fYmin(rhs.fYmin), fYmax(rhs.fYmax),
       fZmin(rhs.fZmin), fZmax(rhs.fZmax),
-      fTolerance(rhs.fTolerance),
+      fTolerance(rhs.fTolerance), kCarTolerance(rhs.kCarTolerance),
       fFaces(rhs.fFaces), fCumulativeArea(rhs.fCumulativeArea)
 {
-    fpPolyhedron      = nullptr;
-    fRebuildPolyhedron = true;
-}
-
-G4StepSolid& G4StepSolid::operator=(const G4StepSolid& rhs) {
-    if (this == &rhs) return *this;
-    G4VSolid::operator=(rhs);
-    fVerboseLevel   = rhs.fVerboseLevel;
-    fShape          = rhs.fShape;
-    fXmin = rhs.fXmin; fXmax = rhs.fXmax;
-    fYmin = rhs.fYmin; fYmax = rhs.fYmax;
-    fZmin = rhs.fZmin; fZmax = rhs.fZmax;
-    fTolerance      = rhs.fTolerance;
-    fFaces          = rhs.fFaces;
-    fCumulativeArea = rhs.fCumulativeArea;
-
-    delete fpPolyhedron;
     fpPolyhedron       = nullptr;
     fRebuildPolyhedron = true;
-
-    AlgoCache* algo = fAlgoCache.Get();
-    if (algo) {
-        std::lock_guard<std::mutex> lock(sAllCachesMutex);
-        auto it = std::find(sAllCaches.begin(), sAllCaches.end(), algo);
-        if (it != sAllCaches.end()) sAllCaches.erase(it);
-        delete algo;
-        fAlgoCache.Put(nullptr);
-    }
-    return *this;
 }
 
 // ====================================================================
 // Private helpers
 // ====================================================================
-void G4StepSolid::CalcBBox() {
+void G4StepSolidImpl::CalcBBox() {
     Bnd_Box box;
     BRepBndLib::Add(fShape, box);
     box.Get(fXmin, fYmin, fZmin, fXmax, fYmax, fZmax);
 }
 
-void G4StepSolid::BuildFaceWeights() {
+void G4StepSolidImpl::BuildFaceWeights() {
     fFaces.clear();
     fCumulativeArea.clear();
     G4double cumArea = 0.0;
@@ -303,6 +295,20 @@ void G4StepSolid::BuildFaceWeights() {
                 }
                 break;
             }
+            case GeomAbs_Cone:
+                // Phase A (Cone/Torus): classify only; no analytic surface math yet.
+                // analyticTrimSafe=false routes the face through the trim-exact OCCT
+                // per-face IntCurvesFace_Intersector in the ray-parity path, so that
+                // cone/torus solids can use analytic-parity Inside() instead of the
+                // BRepClass3d_SolidClassifier pathology. Geometric params (half-angle,
+                // radii) are extracted later if Phase B/C adds analytic intersection.
+                fe.surfType         = FaceEntry::SurfType::Cone;
+                fe.analyticTrimSafe = false;
+                break;
+            case GeomAbs_Torus:
+                fe.surfType         = FaceEntry::SurfType::Torus;
+                fe.analyticTrimSafe = false;
+                break;
             default:
                 fe.surfType = FaceEntry::SurfType::Other;
                 break;
@@ -327,34 +333,55 @@ void G4StepSolid::BuildFaceWeights() {
 // ====================================================================
 // Inside
 // ====================================================================
-EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
+EInside G4StepSolidImpl::Inside(const G4ThreeVector& p) const {
+    AlgoCache* algo = nullptr;
+    Clock::time_point t0;
+    if (fTimingEnabled) { algo = GetAlgo(); t0 = Clock::now(); }
+
     if (p.x() < fXmin || p.x() > fXmax ||
         p.y() < fYmin || p.y() > fYmax ||
         p.z() < fZmin || p.z() > fZmax)
     {
+        if (fTimingEnabled) {
+            algo->timing.insideNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.insideCount;
+        }
         if (fVerboseLevel >= 2) {
-            G4cout << "[G4StepSolid::" << GetName() << "::Inside][local]"
+            G4cout << "[G4StepSolidImpl::" << GetName() << "::Inside][local]"
                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                    << " -> kOutside (bbox)" << G4endl;
         }
         return kOutside;
     }
 
-    AlgoCache* algo = GetAlgo();
+    if (!algo) algo = GetAlgo();
     EInside result = kOutside;
     const gp_Pnt pt = G4toOCCT(p);
     for (size_t i = 0; i < algo->solidClassifiers.size(); ++i) {
-        if (algo->solidBoxes[i].IsOut(pt)) continue;
+        if (solidBoxes[i].IsOut(pt)) continue;
 
         // CT-IN: analytic point-in-solid via ray parity for solids whose faces are
         // ALL analytic-complete types (Plane/Cylinder/Sphere). Solids with Cone or
         // Torus faces fall back to BRepClass3d_SolidClassifier::Perform unchanged.
         // This replaces the per-call OCCT classifier (594k–1.5M ns/call pathology
         // on RP.step parts 0/1/2) with a sub-µs analytic ray cast.
-        if (algo->analyticInsideOK[i]) {
+        if (analyticInsideOK[i] && !sInsideForceOCCT) {
             bool ok = true;
             EInside ai = InsideSolidAnalytic((int)i, p, algo, ok);
             if (ok) {
+                // CT-IN debug self-check: compare analytic vs OCCT per solid.
+                static bool selfcheck = G4StepConfig::Get().insideSelfcheck;
+                if (selfcheck) {
+                    algo->solidClassifiers[i]->Perform(pt, SolidBand((int)i));
+                    auto st = algo->solidClassifiers[i]->State();
+                    EInside occt = (st==TopAbs_IN) ? kInside : (st==TopAbs_ON) ? kSurface : kOutside;
+                    if (occt != ai) {
+                        G4cout << "[SELFCHECK MISMATCH] " << GetName() << " solid#" << i
+                               << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
+                               << " analytic=" << (int)ai << " occt=" << (int)occt << G4endl;
+                    }
+                }
+                if (fTimingEnabled) ++algo->timing.insideAnalyticCount;
                 if (ai == kInside) { result = kInside; break; }
                 if (ai == kSurface) result = kSurface;
                 continue;
@@ -362,14 +389,19 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
             // Ambiguous (degenerate ray after perturbations) → fall through to OCCT.
         }
 
-        algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
+        if (fTimingEnabled) ++algo->timing.insideFallbackCount;
+        algo->solidClassifiers[i]->Perform(pt, SolidBand((int)i));
         auto s = algo->solidClassifiers[i]->State();
         if (s == TopAbs_IN) { result = kInside; break; }
         if (s == TopAbs_ON) result = kSurface;
     }
 
+    if (fTimingEnabled) {
+        algo->timing.insideNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.insideCount;
+    }
     if (fVerboseLevel >= 2) {
-        G4cout << "[G4StepSolid::" << GetName() << "::Inside][local]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::Inside][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                << " -> " << (result==kInside?"kInside":result==kOutside?"kOutside":"kSurface")
                << G4endl;
@@ -382,21 +414,34 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
 // ====================================================================
 // DistanceToIn
 // ====================================================================
-G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
+G4double G4StepSolidImpl::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
     G4double result = RayCastToBoundary(p, v, BoundaryKind::Entry);
+    if (fTimingEnabled) {
+        AlgoCache* algo = GetAlgo();
+        algo->timing.dtiVecNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtiVecCount;
+    }
     if (sRecordEnabled)
         RecordQuery(QueryType::DistToIn, p, v, 0, result, -1);
     return result;
 }
 
-G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
+G4double G4StepSolidImpl::DistanceToIn(const G4ThreeVector& p) const {
+    AlgoCache* algo = fTimingEnabled ? GetAlgo() : nullptr;
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
+
     G4double dx = std::max({fXmin - p.x(), p.x() - fXmax, 0.0});
     G4double dy = std::max({fYmin - p.y(), p.y() - fYmax, 0.0});
     G4double dz = std::max({fZmin - p.z(), p.z() - fZmax, 0.0});
     G4double bboxDist = std::sqrt(dx*dx + dy*dy + dz*dz);
     if (bboxDist > 0.0) {
+        if (fTimingEnabled) {
+            algo->timing.dtiScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.dtiScalCount;
+        }
         if (fVerboseLevel >= 2) {
-            G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
+            G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToIn(p)][local]"
                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                    << " -> " << bboxDist << " (bbox)" << G4endl;
         }
@@ -405,8 +450,12 @@ G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
 
     NearestFaceResult nr = NearestFace(G4toOCCT(p));
     G4double result = (nr.idx >= 0) ? nr.dist : 0.0;
+    if (fTimingEnabled) {
+        algo->timing.dtiScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtiScalCount;
+    }
     if (fVerboseLevel >= 2) {
-        G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn(p)][local]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToIn(p)][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                << " -> " << result << G4endl;
     }
@@ -416,10 +465,16 @@ G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const {
 // ====================================================================
 // DistanceToOut
 // ====================================================================
-G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
+G4double G4StepSolidImpl::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
                                     const G4bool calcNorm, G4bool* validNorm,
                                     G4ThreeVector* n) const {
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
     G4double result = RayCastToBoundary(p, v, BoundaryKind::Exit, calcNorm, validNorm, n);
+    if (fTimingEnabled) {
+        AlgoCache* algo = GetAlgo();
+        algo->timing.dtoVecNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtoVecCount;
+    }
     if (sRecordEnabled) {
         // Rigorous stuck signature: Inside==kInside AND DistanceToOut≈0.
         int insideAtP = Inside(p);
@@ -428,15 +483,22 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector&
     return result;
 }
 
-G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
+G4double G4StepSolidImpl::DistanceToOut(const G4ThreeVector& p) const {
+    AlgoCache* algo = fTimingEnabled ? GetAlgo() : nullptr;
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
+
     // G4 contract: DistanceToOut(p) is only called for points already inside the solid.
     // Replacing Inside() (which calls BRepClass3d_SolidClassifier::Perform()) with a
     // cheap AABB guard eliminates the dominant single-thread and MT bottleneck.
     if (p.x() < fXmin || p.x() > fXmax ||
         p.y() < fYmin || p.y() > fYmax ||
         p.z() < fZmin || p.z() > fZmax) {
+        if (fTimingEnabled) {
+            algo->timing.dtoScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.dtoScalCount;
+        }
         if (fVerboseLevel >= 2) {
-            G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
+            G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToOut(p)][local]"
                    << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                    << " -> 0.0 (outside AABB)" << G4endl;
         }
@@ -446,8 +508,12 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
     NearestFaceResult nr = NearestFace(G4toOCCT(p));
     G4double result = (nr.idx >= 0) ? nr.dist : 0.0;
 
+    if (fTimingEnabled) {
+        algo->timing.dtoScalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.dtoScalCount;
+    }
     if (fVerboseLevel >= 2) {
-        G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut(p)][local]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToOut(p)][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                << " -> " << result << G4endl;
     }
@@ -457,14 +523,29 @@ G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const {
 // ====================================================================
 // SurfaceNormal
 // ====================================================================
-G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
+G4ThreeVector G4StepSolidImpl::SurfaceNormal(const G4ThreeVector& p) const {
+    AlgoCache* algo = fTimingEnabled ? GetAlgo() : nullptr;
+    auto t0 = fTimingEnabled ? Clock::now() : Clock::time_point{};
+
     NearestFaceResult nr = NearestFace(G4toOCCT(p));
     if (nr.idx < 0) {
-        if (fVerboseLevel >= 2) {
-            G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
-                   << " no solution -> (0,0,1)" << G4endl;
+        if (fTimingEnabled) {
+            algo->timing.normalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+            ++algo->timing.normalCount;
         }
-        return G4ThreeVector(0, 0, 1);
+        // No nearest face found — p is effectively off the solid. Per the Geant4
+        // G4VSolid convention, warn (rather than silently returning a fixed axis
+        // that can mask a real navigation/geometry bug) and return a best-effort
+        // outward normal (from the bbox centre toward p).
+        G4ExceptionDescription ed;
+        ed << "No nearest face for p=(" << p.x() << "," << p.y() << "," << p.z()
+           << ") on solid '" << GetName() << "' — p is not on the surface; "
+           << "returning an approximate outward normal.";
+        G4Exception("G4StepSolidImpl::SurfaceNormal()", "G4StepSolid_SurfaceNormal",
+                    JustWarning, ed);
+        const G4ThreeVector centre(0.5*(fXmin+fXmax), 0.5*(fYmin+fYmax), 0.5*(fZmin+fZmax));
+        const G4ThreeVector approx = p - centre;
+        return (approx.mag2() > 0.0) ? approx.unit() : G4ThreeVector(0, 0, 1);
     }
 
     const TopoDS_Face& face = fFaces[nr.idx].face;
@@ -478,8 +559,12 @@ G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
     if (face.Orientation() == TopAbs_REVERSED) norm.Reverse();
     G4ThreeVector result = OCCTtoG4(gp_Dir(norm));
 
+    if (fTimingEnabled) {
+        algo->timing.normalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+        ++algo->timing.normalCount;
+    }
     if (fVerboseLevel >= 2) {
-        G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::SurfaceNormal][local]"
                << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                << " -> (" << result.x() << "," << result.y() << "," << result.z() << ")"
                << G4endl;
@@ -490,7 +575,7 @@ G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
 // ====================================================================
 // GetPointOnSurface
 // ====================================================================
-G4ThreeVector G4StepSolid::GetPointOnSurface() const {
+G4ThreeVector G4StepSolidImpl::GetPointOnSurface() const {
     if (fFaces.empty()) return G4ThreeVector(0, 0, 0);
 
     const G4double totalArea = fCumulativeArea.back();
@@ -521,24 +606,24 @@ G4ThreeVector G4StepSolid::GetPointOnSurface() const {
 // ====================================================================
 // BoundingLimits / CalculateExtent
 // ====================================================================
-void G4StepSolid::BoundingLimits(G4ThreeVector& pMin, G4ThreeVector& pMax) const {
+void G4StepSolidImpl::BoundingLimits(G4ThreeVector& pMin, G4ThreeVector& pMax) const {
     pMin.set(fXmin, fYmin, fZmin);
     pMax.set(fXmax, fYmax, fZmax);
     if (fVerboseLevel >= 2) {
-        G4cout << "[G4StepSolid::" << GetName() << "::BoundingLimits]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::BoundingLimits]"
                << " pMin=(" << fXmin << "," << fYmin << "," << fZmin << ")"
                << " pMax=(" << fXmax << "," << fYmax << "," << fZmax << ")" << G4endl;
     }
 }
 
-G4bool G4StepSolid::CalculateExtent(const EAxis pAxis, const G4VoxelLimits& pVoxelLimit,
+G4bool G4StepSolidImpl::CalculateExtent(const EAxis pAxis, const G4VoxelLimits& pVoxelLimit,
                                     const G4AffineTransform& pTransform,
                                     G4double& pMin, G4double& pMax) const {
     G4ThreeVector bmin(fXmin, fYmin, fZmin), bmax(fXmax, fYmax, fZmax);
     G4BoundingEnvelope bbox(bmin, bmax);
     G4bool result = bbox.CalculateExtent(pAxis, pVoxelLimit, pTransform, pMin, pMax);
     if (fVerboseLevel >= 2) {
-        G4cout << "[G4StepSolid::" << GetName() << "::CalculateExtent]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::CalculateExtent]"
                << " axis=" << pAxis
                << " -> [" << pMin << "," << pMax << "]  ok=" << result << G4endl;
     }
@@ -548,11 +633,11 @@ G4bool G4StepSolid::CalculateExtent(const EAxis pAxis, const G4VoxelLimits& pVox
 // ====================================================================
 // Visualisation
 // ====================================================================
-void G4StepSolid::DescribeYourselfTo(G4VGraphicsScene& scene) const {
-    scene.AddSolid(*this);
+void G4StepSolidImpl::DescribeYourselfTo(G4VGraphicsScene& scene) const {
+    scene.AddSolid(*fOwner);
 }
 
-G4Polyhedron* G4StepSolid::GetPolyhedron() const {
+G4Polyhedron* G4StepSolidImpl::GetPolyhedron() const {
     G4AutoLock l(&polyhedronMutex);
     if (!fpPolyhedron || fRebuildPolyhedron ||
         fpPolyhedron->GetNumberOfRotationStepsAtTimeOfCreation() !=
@@ -565,7 +650,7 @@ G4Polyhedron* G4StepSolid::GetPolyhedron() const {
     return fpPolyhedron;
 }
 
-G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
+G4Polyhedron* G4StepSolidImpl::CreatePolyhedron() const {
     if (fVerboseLevel >= 1) {
         G4cout << "G4StepSolid: generating mesh for " << GetName() << " ..." << G4endl;
     }
@@ -573,10 +658,10 @@ G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
     try {
         BRepMesh_IncrementalMesh meshGen(fShape, kMeshDeflection);
     } catch (const std::exception& e) {
-        G4cerr << "G4StepSolid::CreatePolyhedron: mesh failed for "
+        G4cerr << "G4StepSolidImpl::CreatePolyhedron: mesh failed for "
                << GetName() << ": " << e.what() << G4endl;
     } catch (...) {
-        G4cerr << "G4StepSolid::CreatePolyhedron: mesh failed for "
+        G4cerr << "G4StepSolidImpl::CreatePolyhedron: mesh failed for "
                << GetName() << " (unknown exception)" << G4endl;
     }
 
@@ -592,7 +677,7 @@ G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
     }
 
     if (nFacets == 0) {
-        G4cerr << "G4StepSolid::CreatePolyhedron: no triangles for "
+        G4cerr << "G4StepSolidImpl::CreatePolyhedron: no triangles for "
                << GetName() << ", using fallback box" << G4endl;
         return new G4PolyhedronBox(10, 10, 10);
     }
@@ -626,7 +711,108 @@ G4Polyhedron* G4StepSolid::CreatePolyhedron() const {
     return poly;
 }
 
-std::ostream& G4StepSolid::StreamInfo(std::ostream& os) const {
+// ====================================================================
+// Timing
+// ====================================================================
+void G4StepSolidImpl::SetTimingEnabled(G4bool enable) {
+    fTimingEnabled = enable;
+    if (!enable) return;
+    {
+        std::lock_guard<std::mutex> lock(sTimedSolidsMutex);
+        if (std::find(sTimedSolids.begin(), sTimedSolids.end(), this) == sTimedSolids.end())
+            sTimedSolids.push_back(this);
+    }
+    std::call_once(sAtexitFlag, []{ std::atexit(G4StepSolidImpl::PrintAllTimingReports); });
+}
+
+namespace {
+    void PrintTimingRow(const char* name, int64_t ns, int64_t count) {
+        if (count == 0) return;
+        G4cout << "  " << std::left << std::setw(24) << name
+               << std::right << std::setw(10) << count << " calls"
+               << std::setw(12) << (ns / count) << " ns/call"
+               << std::setw(12) << (ns / 1000) << " µs total"
+               << G4endl;
+    }
+}
+
+void G4StepSolidImpl::PrintTimingReport() const {
+    TimingStats total;
+    int64_t uvTrimAccept = 0, uvTrimBandFallback = 0;  // CT-TRIM (AlgoCache members)
+    {
+        std::lock_guard<std::mutex> lock(sAllCachesMutex);
+        for (const AlgoCache* c : sAllCaches) {
+            if (c->owner != this) continue;
+            uvTrimAccept       += c->uvTrimAccept;
+            uvTrimBandFallback += c->uvTrimBandFallback;
+            total.insideNs    += c->timing.insideNs;
+            total.insideCount += c->timing.insideCount;
+            total.dtiVecNs    += c->timing.dtiVecNs;
+            total.dtiVecCount += c->timing.dtiVecCount;
+            total.dtiScalNs   += c->timing.dtiScalNs;
+            total.dtiScalCount+= c->timing.dtiScalCount;
+            total.dtoVecNs    += c->timing.dtoVecNs;
+            total.dtoVecCount += c->timing.dtoVecCount;
+            total.dtoScalNs   += c->timing.dtoScalNs;
+            total.dtoScalCount+= c->timing.dtoScalCount;
+            total.normalNs    += c->timing.normalNs;
+            total.normalCount += c->timing.normalCount;
+            // Sub-counters
+            total.rayFacesVisited  += c->timing.rayFacesVisited;
+            total.rayPerformCount  += c->timing.rayPerformCount;
+            total.rayHitsTotal     += c->timing.rayHitsTotal;
+            total.rayAnalyticCount += c->timing.rayAnalyticCount;
+            total.rayFallbackCount += c->timing.rayFallbackCount;
+            total.nfFacesVisited   += c->timing.nfFacesVisited;
+            total.nfExtremaCount   += c->timing.nfExtremaCount;
+            total.nfAnalyticCount  += c->timing.nfAnalyticCount;
+            total.nfFallbackCount  += c->timing.nfFallbackCount;
+            total.insideAnalyticCount += c->timing.insideAnalyticCount;
+            total.insideFallbackCount += c->timing.insideFallbackCount;
+        }
+    }
+    G4cout << "[G4StepSolid timing] " << GetName() << G4endl;
+    PrintTimingRow("Inside",              total.insideNs,   total.insideCount);
+    PrintTimingRow("DistanceToIn(p,v)",   total.dtiVecNs,   total.dtiVecCount);
+    PrintTimingRow("DistanceToIn(p)",     total.dtiScalNs,  total.dtiScalCount);
+    PrintTimingRow("DistanceToOut(p,v)",  total.dtoVecNs,   total.dtoVecCount);
+    PrintTimingRow("DistanceToOut(p)",    total.dtoScalNs,  total.dtoScalCount);
+    PrintTimingRow("SurfaceNormal",       total.normalNs,   total.normalCount);
+    // Inner-loop sub-counters
+    int64_t dtiVecCalls = total.dtiVecCount;
+    int64_t dtoVecCalls = total.dtoVecCount;
+    int64_t vecCalls    = dtiVecCalls + dtoVecCalls;
+    int64_t nfCalls     = total.dtoScalCount + total.normalCount;
+    G4cout << "  -- RayCast inner (DistanceToIn/Out(p,v)) --" << G4endl;
+    G4cout << "    ray vec calls (DTI+DTO):   " << vecCalls << G4endl;
+    G4cout << "    ray faces visited (slab):  " << total.rayFacesVisited
+           << (vecCalls ? G4String("  (~") + std::to_string(total.rayFacesVisited/(vecCalls?vecCalls:1)) + " faces/call)" : "") << G4endl;
+    G4cout << "    ray Perform (OCCT):        " << total.rayPerformCount << G4endl;
+    G4cout << "    ray analytic hits:         " << total.rayAnalyticCount << G4endl;
+    G4cout << "    ray fallback hits:         " << total.rayFallbackCount << G4endl;
+    G4cout << "    ray total hits produced:   " << total.rayHitsTotal << G4endl;
+    G4cout << "  -- NearestFace (DistanceToOut(p) + SurfaceNormal) --" << G4endl;
+    G4cout << "    nf scalar+normal calls:    " << nfCalls << G4endl;
+    G4cout << "    nf faces visited (bbox):   " << total.nfFacesVisited
+           << (nfCalls ? G4String("  (~") + std::to_string(total.nfFacesVisited/(nfCalls?nfCalls:1)) + " faces/call)" : "") << G4endl;
+    G4cout << "    nf Extrema (OCCT):         " << total.nfExtremaCount << G4endl;
+    G4cout << "    nf analytic hits:          " << total.nfAnalyticCount << G4endl;
+    G4cout << "    nf fallback hits:          " << total.nfFallbackCount << G4endl;
+    G4cout << "  -- Inside (CT-IN: analytic ray parity vs OCCT classifier) --" << G4endl;
+    G4cout << "    inside analytic (parity):  " << total.insideAnalyticCount << G4endl;
+    G4cout << "    inside fallback (OCCT):    " << total.insideFallbackCount << G4endl;
+    G4cout << "  -- CT-TRIM/CT-TRIM-2 (UV v-band + seam-aware polygon trim) --" << G4endl;
+    G4cout << "    uv-trim analytic accept:   " << uvTrimAccept << G4endl;
+    G4cout << "    uv-trim band → OCCT:       " << uvTrimBandFallback << G4endl;
+}
+
+void G4StepSolidImpl::PrintAllTimingReports() {
+    std::lock_guard<std::mutex> lock(sTimedSolidsMutex);
+    for (const G4StepSolidImpl* s : sTimedSolids)
+        s->PrintTimingReport();
+}
+
+std::ostream& G4StepSolidImpl::StreamInfo(std::ostream& os) const {
     os << "G4StepSolid: " << GetName()
        << "  bbox=[" << fXmin << "," << fXmax << "] x ["
        << fYmin << "," << fYmax << "] x ["
@@ -635,3 +821,62 @@ std::ostream& G4StepSolid::StreamInfo(std::ostream& os) const {
        << "  faces=" << fFaces.size();
     return os;
 }
+
+// ====================================================================
+// Public G4StepSolid — thin pImpl wrapper (P4). Keeps the G4VSolid vtable;
+// forwards to G4StepSolidImpl. Ctor/dtor/copy are out-of-line here because
+// G4StepSolidImpl is incomplete in the public header.
+// ====================================================================
+G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
+                         G4double tolerance)
+    : G4VSolid(name),
+      fImpl(std::make_unique<G4StepSolidImpl>(stepShape, tolerance, this)) {}
+
+G4StepSolid::~G4StepSolid() = default;
+
+G4StepSolid::G4StepSolid(const G4StepSolid& rhs)
+    : G4VSolid(rhs),
+      fImpl(std::make_unique<G4StepSolidImpl>(*rhs.fImpl, this)) {}
+
+G4StepSolid& G4StepSolid::operator=(const G4StepSolid& rhs) {
+    if (this == &rhs) return *this;
+    G4VSolid::operator=(rhs);
+    // Replacing fImpl destroys the old Impl (its dtor removes its per-thread caches
+    // from the registry under the mutex — the historical UAF guard) and rebuilds a
+    // fresh Impl owning `this`, with an empty cache (GetAlgo repopulates lazily).
+    fImpl = std::make_unique<G4StepSolidImpl>(*rhs.fImpl, this);
+    return *this;
+}
+
+void   G4StepSolid::SetVerboseLevel(G4int level)    { fImpl->fVerboseLevel = level; }
+G4int  G4StepSolid::GetVerboseLevel() const         { return fImpl->fVerboseLevel; }
+void   G4StepSolid::SetTimingEnabled(G4bool enable) { fImpl->SetTimingEnabled(enable); }
+G4bool G4StepSolid::GetTimingEnabled() const        { return fImpl->fTimingEnabled; }
+void   G4StepSolid::PrintTimingReport() const       { fImpl->PrintTimingReport(); }
+void   G4StepSolid::PrintAllTimingReports()         { G4StepSolidImpl::PrintAllTimingReports(); }
+
+EInside G4StepSolid::Inside(const G4ThreeVector& p) const { return fImpl->Inside(p); }
+G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p, const G4ThreeVector& v) const {
+    return fImpl->DistanceToIn(p, v);
+}
+G4double G4StepSolid::DistanceToIn(const G4ThreeVector& p) const { return fImpl->DistanceToIn(p); }
+G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p, const G4ThreeVector& v,
+                                    const G4bool calcNorm, G4bool* validNorm,
+                                    G4ThreeVector* n) const {
+    return fImpl->DistanceToOut(p, v, calcNorm, validNorm, n);
+}
+G4double G4StepSolid::DistanceToOut(const G4ThreeVector& p) const { return fImpl->DistanceToOut(p); }
+G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const { return fImpl->SurfaceNormal(p); }
+void G4StepSolid::BoundingLimits(G4ThreeVector& pMin, G4ThreeVector& pMax) const {
+    fImpl->BoundingLimits(pMin, pMax);
+}
+G4bool G4StepSolid::CalculateExtent(const EAxis pAxis, const G4VoxelLimits& pVoxelLimit,
+                                    const G4AffineTransform& pTransform,
+                                    G4double& pMin, G4double& pMax) const {
+    return fImpl->CalculateExtent(pAxis, pVoxelLimit, pTransform, pMin, pMax);
+}
+std::ostream& G4StepSolid::StreamInfo(std::ostream& os) const { return fImpl->StreamInfo(os); }
+void G4StepSolid::DescribeYourselfTo(G4VGraphicsScene& scene) const { fImpl->DescribeYourselfTo(scene); }
+G4Polyhedron* G4StepSolid::CreatePolyhedron() const { return fImpl->CreatePolyhedron(); }
+G4Polyhedron* G4StepSolid::GetPolyhedron() const { return fImpl->GetPolyhedron(); }
+G4ThreeVector G4StepSolid::GetPointOnSurface() const { return fImpl->GetPointOnSurface(); }
