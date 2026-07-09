@@ -1,4 +1,4 @@
-#include "G4StepSolid.hh"
+#include "G4StepSolidImpl.hh"
 #include "G4StepConfig.hh"
 
 // OCCT
@@ -267,7 +267,7 @@ namespace {
 // ====================================================================
 // GroupHits — in-place sort + group (modifies hits vector)
 // ====================================================================
-void G4StepSolid::GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& out, G4double tol) {
+void G4StepSolidImpl::GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& out, G4double tol) {
     out.clear();
     if (hits.empty()) return;
     std::sort(hits.begin(), hits.end(),
@@ -307,13 +307,13 @@ void G4StepSolid::GroupHits(std::vector<RayHit>& hits, std::vector<HitGroup>& ou
 // ====================================================================
 // AlgoCache
 // ====================================================================
-int G4StepSolid::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
+int G4StepSolidImpl::AlgoCache::FaceToSolid(const TopoDS_Face& f) const {
     if (faceSolidMap.IsBound(f)) return faceSolidMap.Find(f);
     return -1;
 }
 
-G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
-                                   const G4StepSolid* ownerSolid)
+G4StepSolidImpl::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
+                                   const G4StepSolidImpl* ownerSolid)
     : owner(ownerSolid)
 {
     requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
@@ -372,7 +372,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
         // intersector (Phase A), so they no longer disqualify a solid from analytic
         // (ray-parity) Inside(). Only a genuinely unhandled type (Other = BSpline/
         // Bezier/Revolution/…) forces the whole solid onto BRepClass3d.
-        if (st == G4StepSolid::FaceEntry::SurfType::Other) {
+        if (st == G4StepSolidImpl::FaceEntry::SurfType::Other) {
             analyticInsideOK[si] = 0;  // unhandled surface → OCCT classifier for this solid
         }
     }
@@ -474,7 +474,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
         });
 }
 
-G4StepSolid::AlgoCache::~AlgoCache() {
+G4StepSolidImpl::AlgoCache::~AlgoCache() {
     for (auto* p : faceIntersectors) delete p;
     for (auto* p : faceExtrema)      delete p;
 }
@@ -482,7 +482,7 @@ G4StepSolid::AlgoCache::~AlgoCache() {
 // ====================================================================
 // GetAlgo
 // ====================================================================
-G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
+G4StepSolidImpl::AlgoCache* G4StepSolidImpl::GetAlgo() const {
     AlgoCache* algo = fAlgoCache.Get();
     if (!algo) {
         algo = new AlgoCache(fShape, fTolerance, this);
@@ -496,7 +496,7 @@ G4StepSolid::AlgoCache* G4StepSolid::GetAlgo() const {
 // ====================================================================
 // GetNormalAtIntersection
 // ====================================================================
-G4ThreeVector G4StepSolid::GetNormalAtIntersection(const TopoDS_Face& face,
+G4ThreeVector G4StepSolidImpl::GetNormalAtIntersection(const TopoDS_Face& face,
                                                     G4double u, G4double v) const {
     BRepAdaptor_Surface surf(face);
     gp_Pnt pSurf; gp_Vec d1u, d1v;
@@ -509,7 +509,7 @@ G4ThreeVector G4StepSolid::GetNormalAtIntersection(const TopoDS_Face& face,
 // ====================================================================
 // NearestFace  —  analytic fast-path for Plane/Cylinder/Sphere
 // ====================================================================
-G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const {
+G4StepSolidImpl::NearestFaceResult G4StepSolidImpl::NearestFace(const gp_Pnt& pt) const {
     NearestFaceResult result;
     if (fFaces.empty()) return result;
 
@@ -648,7 +648,7 @@ G4StepSolid::NearestFaceResult G4StepSolid::NearestFace(const gp_Pnt& pt) const 
 // ====================================================================
 // RayCastToBoundary
 // ====================================================================
-G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVector& v,
+G4double G4StepSolidImpl::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVector& v,
                                          BoundaryKind kind,
                                          G4bool calcNorm, G4bool* validNorm,
                                          G4ThreeVector* n) const
@@ -827,7 +827,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
                     // path is rare — DistanceToIn is normally queried from outside).
                     if (Inside(p) == kInside) {
                         if (fVerboseLevel >= 2)
-                            G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
+                            G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToIn][local]"
                                    << " first forward crossing is Exit & p inside -> 0.0" << G4endl;
                         return 0.0;
                     }
@@ -847,7 +847,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
                 *validNorm = !reentersAfter(g.dist);
             }
             if (fVerboseLevel >= 2) {
-                G4cout << "[G4StepSolid::" << GetName() << "::" << fnName << "][local]"
+                G4cout << "[G4StepSolidImpl::" << GetName() << "::" << fnName << "][local]"
                        << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                        << " v=(" << v.x() << "," << v.y() << "," << v.z() << ")"
                        << " -> 0.0 (on boundary, band=" << band << ")" << G4endl;
@@ -860,7 +860,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
                 *validNorm = !reentersAfter(g.dist);
             }
             if (fVerboseLevel >= 2) {
-                G4cout << "[G4StepSolid::" << GetName() << "::" << fnName << "][local]"
+                G4cout << "[G4StepSolidImpl::" << GetName() << "::" << fnName << "][local]"
                        << " p=(" << p.x() << "," << p.y() << "," << p.z() << ")"
                        << " v=(" << v.x() << "," << v.y() << "," << v.z() << ")"
                        << " -> " << g.dist << G4endl;
@@ -892,7 +892,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
         if (Inside(p) != kOutside)
             return kCarTolerance;
         if (fVerboseLevel >= 2)
-            G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
+            G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToIn][local]"
                    << " no real boundary -> kInfinity" << G4endl;
         return kInfinity;
     }
@@ -904,7 +904,7 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     if (v.z() > 0.0)       t = std::min(t, (fZmax - p.z()) / v.z());
     else if (v.z() < 0.0)  t = std::min(t, (fZmin - p.z()) / v.z());
     if (fVerboseLevel >= 2)
-        G4cout << "[G4StepSolid::" << GetName() << "::DistanceToOut][local]"
+        G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToOut][local]"
                << " no real boundary -> bbox=" << t << G4endl;
     return (t > 0.0 && std::isfinite(t)) ? t : 0.0;
 }
@@ -942,7 +942,7 @@ static inline int CrossingNumberRing(const std::vector<double>& ru,
 //                 rings AND not inside any hole. Used for faces (part_1's full-2π
 //                 cylinders) whose outer trim carries a seam-crossing notch so a v-band
 //                 envelope is wrong near the seam.
-int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) {
+int G4StepSolidImpl::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) {
     if (!t.valid) return -1;
     double uu = u;
     if (t.periodic) {
@@ -1005,8 +1005,8 @@ int G4StepSolid::ClassifyUVTrim(const AlgoCache::UVTrim& t, double u, double v) 
 // against BRepTopAdaptor_FClass2d on a dense UV grid. .valid is set true only when the
 // band reproduces OCCT's in/out classification with ZERO mismatch. Conservative by
 // design: any face that does not validate keeps .valid=false and is never accelerated.
-G4StepSolid::AlgoCache::UVTrim
-G4StepSolid::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
+G4StepSolidImpl::AlgoCache::UVTrim
+G4StepSolidImpl::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
     AlgoCache::UVTrim t;
     // Only cylinder faces with a non-trivial (non-trim-safe) trim qualify.
     if (fe.surfType != FaceEntry::SurfType::Cylinder) return t;
@@ -1252,7 +1252,7 @@ G4StepSolid::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
 //
 // This mirrors the EXACT transition/UV math of RayCastToBoundary so that Inside()
 // and DistanceToIn/Out agree on whether a point is on/in/out of the boundary.
-bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
+bool G4StepSolidImpl::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVector& p,
                                          const G4ThreeVector& dir, G4double octTol,
                                          std::vector<RayHit>& hits) const
 {
@@ -1370,7 +1370,7 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
 // rays (grazing edges/vertices producing only Tangent groups near the parity
 // boundary, or an odd number of net-zero-cancelling groups) are retried with a
 // deterministically perturbed direction; `ok=false` if still ambiguous.
-EInside G4StepSolid::InsideSolidAnalytic(int si, const G4ThreeVector& p,
+EInside G4StepSolidImpl::InsideSolidAnalytic(int si, const G4ThreeVector& p,
                                          AlgoCache* algo, bool& ok) const
 {
     ok = true;
