@@ -106,7 +106,7 @@ namespace {
     // Ray vs rectangular-trimmed plane. Returns 0 or 1. The UV-rectangle
     // trim is identical in both call sites (and there is no CT-TRIM plane
     // variant), so it is folded in here.
-    inline int RayIntersectPlane(const gp_Ax3& ax,
+    [[gnu::always_inline]] inline int RayIntersectPlane(const gp_Ax3& ax,
                                  G4double u0, G4double u1, G4double v0, G4double v1,
                                  bool fwd,
                                  G4double ox, G4double oy, G4double oz,
@@ -144,7 +144,7 @@ namespace {
     // ClassifyUVTrim) and stay in the caller. trans is computed for every returned
     // candidate; callers discard off-trim ones (a discarded candidate's trans is
     // never used, so result is identical to the old compute-after-reject order).
-    inline int RayIntersectCylinder(const gp_Ax3& ax, G4double R,
+    [[gnu::always_inline]] inline int RayIntersectCylinder(const gp_Ax3& ax, G4double R,
                                     G4double u0, G4double v0, G4double v1,
                                     bool fwd,
                                     G4double ox, G4double oy, G4double oz,
@@ -204,7 +204,7 @@ namespace {
     // sphere variant and the !fullSph UV-rectangle reject is identical at both
     // sphere sites, so it is folded in here. fullSph is derived from the UV span
     // exactly as before.
-    inline int RayIntersectSphere(const gp_Ax3& pos, G4double R,
+    [[gnu::always_inline]] inline int RayIntersectSphere(const gp_Ax3& pos, G4double R,
                                   G4double u0, G4double u1, G4double v0, G4double v1,
                                   bool fwd,
                                   G4double ox, G4double oy, G4double oz,
