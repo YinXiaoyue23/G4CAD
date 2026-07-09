@@ -801,7 +801,17 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
             const int net = g.nIn - g.nOut;
             if (net == 0) continue;                    // net-zero / tangent / grazing
             const G4double bandE = bandOf(g);
-            if (std::abs(g.dist) < bandE) return 0.0;  // on surface
+            if (std::abs(g.dist) < bandE) {
+                // On the surface. Only an ENTRY crossing here (net>0, v pointing
+                // into the solid) means the particle is entering now → 0. An EXIT
+                // crossing (net<0, v pointing out) means the particle is on the
+                // boundary LEAVING — it is not entering, so this group must be
+                // skipped and a genuine forward re-entry (concave) sought instead;
+                // returning 0 here let the navigator re-enter a just-exited solid at
+                // zero distance, the solid↔world stuck-track oscillation (RP.step).
+                if (net > 0) return 0.0;
+                continue;
+            }
             if (g.dist > bandE) {
                 if (net < 0) {                         // first crossing is EXIT → inside
                     if (fVerboseLevel >= 2)
