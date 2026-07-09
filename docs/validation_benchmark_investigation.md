@@ -607,10 +607,14 @@ on 2026-07-03; not yet run.)
 > could re-enter at distance 0, driving the solid↔world oscillation. Evidence over 124
 > recorded stuck points: 0/124 kInside, DistanceToIn=DistanceToOut=0 for all, grazing
 > only 1/124, and ground-truth stepping shows 107/124 are "on-surface moving OUT".
-> Fix: on-surface returns 0 only for an ENTRY crossing (net>0); exit crossings are
-> skipped. RP stuck 132→8 per 200 events (−94%), 5-geometry gates byte-identical
-> (zero regression). Residual 8 (both-outside slivers) left as follow-up. See
-> `architecture_review.md` §12.5. The historical analysis below is kept for the record.
+> Fix (two commits): (1) `ebc63a3` — on-surface returns 0 only for an ENTRY crossing
+> (net>0); exit crossings skipped (132→8). (2) `64add04` — the "first-forward-Exit
+> beyond band ⇒ p inside ⇒ 0" heuristic (originally the box_hole edep fix) now fires
+> only when `Inside(p)==kInside`; on-surface-leaving points (kSurface) are not treated
+> as inside (8→0). Final: RP stuck **132→0** at 200 and 1000 events, run exit 0;
+> 5-geometry gates byte-identical (zero regression); box_hole edep vs native 0.13σ
+> (edep fix preserved). See `architecture_review.md` §12.5. Historical analysis below
+> kept for the record.
 
 The realistic ALADDIN Roman Pot CAD assembly (`share/example/RP.step`, 13 solids,
 474 faces, planes/cylinders/cones/tori) imports and simulates to completion, but a
