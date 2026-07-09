@@ -599,6 +599,19 @@ on 2026-07-03; not yet run.)
 
 ## 8. Open item — Roman Pot (RP.step) stuck-track warnings (deferred)
 
+> **[2026-07-09 RESOLVED — root cause found, fixed dev `ebc63a3`]** The "grazing /
+> thin-wall / near-coincident" hypothesis below was **disproven** by evidence. Actual
+> root cause: `DistanceToIn(p,v)` returned 0 for a point on the surface band whenever
+> the nearest forward crossing was there, without checking crossing direction — so a
+> track sitting on the boundary *leaving* the solid (exit crossing, net<0) was told it
+> could re-enter at distance 0, driving the solid↔world oscillation. Evidence over 124
+> recorded stuck points: 0/124 kInside, DistanceToIn=DistanceToOut=0 for all, grazing
+> only 1/124, and ground-truth stepping shows 107/124 are "on-surface moving OUT".
+> Fix: on-surface returns 0 only for an ENTRY crossing (net>0); exit crossings are
+> skipped. RP stuck 132→8 per 200 events (−94%), 5-geometry gates byte-identical
+> (zero regression). Residual 8 (both-outside slivers) left as follow-up. See
+> `architecture_review.md` §12.5. The historical analysis below is kept for the record.
+
 The realistic ALADDIN Roman Pot CAD assembly (`share/example/RP.step`, 13 solids,
 474 faces, planes/cylinders/cones/tori) imports and simulates to completion, but a
 2000-event e⁻ run produces ~1133 Geant4 "stuck-track" self-recovery warnings
