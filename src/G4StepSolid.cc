@@ -555,11 +555,19 @@ G4ThreeVector G4StepSolid::SurfaceNormal(const G4ThreeVector& p) const {
             algo->timing.normalNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
             ++algo->timing.normalCount;
         }
-        if (fVerboseLevel >= 2) {
-            G4cout << "[G4StepSolid::" << GetName() << "::SurfaceNormal][local]"
-                   << " no solution -> (0,0,1)" << G4endl;
-        }
-        return G4ThreeVector(0, 0, 1);
+        // No nearest face found — p is effectively off the solid. Per the Geant4
+        // G4VSolid convention, warn (rather than silently returning a fixed axis
+        // that can mask a real navigation/geometry bug) and return a best-effort
+        // outward normal (from the bbox centre toward p).
+        G4ExceptionDescription ed;
+        ed << "No nearest face for p=(" << p.x() << "," << p.y() << "," << p.z()
+           << ") on solid '" << GetName() << "' — p is not on the surface; "
+           << "returning an approximate outward normal.";
+        G4Exception("G4StepSolid::SurfaceNormal()", "G4StepSolid_SurfaceNormal",
+                    JustWarning, ed);
+        const G4ThreeVector centre(0.5*(fXmin+fXmax), 0.5*(fYmin+fYmax), 0.5*(fZmin+fZmax));
+        const G4ThreeVector approx = p - centre;
+        return (approx.mag2() > 0.0) ? approx.unit() : G4ThreeVector(0, 0, 1);
     }
 
     const TopoDS_Face& face = fFaces[nr.idx].face;
