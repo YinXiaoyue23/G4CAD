@@ -813,11 +813,23 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
                 continue;
             }
             if (g.dist > bandE) {
-                if (net < 0) {                         // first crossing is EXIT → inside
-                    if (fVerboseLevel >= 2)
-                        G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
-                               << " first forward crossing is Exit -> p inside -> 0.0" << G4endl;
-                    return 0.0;
+                if (net < 0) {                         // first forward crossing is an EXIT
+                    // Genuinely inside a concave solid (box_hole: track mislocated in
+                    // World but physically inside) → the far exit is the first forward
+                    // crossing and DistanceToIn=0 is correct. But a track sitting ON
+                    // the surface and LEAVING (e.g. exiting part_2 axially) also sees a
+                    // far exit as its first forward crossing while Inside(p)=kSurface —
+                    // it is not inside, so returning 0 lets the navigator re-enter a
+                    // just-exited solid → residual solid↔world stuck oscillation.
+                    // Discriminate with Inside(p) (analytic & fast here; this net<0
+                    // path is rare — DistanceToIn is normally queried from outside).
+                    if (Inside(p) == kInside) {
+                        if (fVerboseLevel >= 2)
+                            G4cout << "[G4StepSolid::" << GetName() << "::DistanceToIn][local]"
+                                   << " first forward crossing is Exit & p inside -> 0.0" << G4endl;
+                        return 0.0;
+                    }
+                    continue;                          // on surface / outside & leaving → seek real entry
                 }
                 return g.dist;                         // net > 0 → genuine forward entry
             }
