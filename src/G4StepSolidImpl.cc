@@ -368,10 +368,12 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
         }
         solidFaceIdx[si].push_back(fi);
         const auto st = ownerSolid->fFaces[fi].surfType;
-        if (st != G4StepSolid::FaceEntry::SurfType::Plane &&
-            st != G4StepSolid::FaceEntry::SurfType::Cylinder &&
-            st != G4StepSolid::FaceEntry::SurfType::Sphere) {
-            analyticInsideOK[si] = 0;  // Cone/Torus/Other → OCCT fallback for this solid
+        // Cone/Torus are handled in the parity path via the trim-exact OCCT per-face
+        // intersector (Phase A), so they no longer disqualify a solid from analytic
+        // (ray-parity) Inside(). Only a genuinely unhandled type (Other = BSpline/
+        // Bezier/Revolution/…) forces the whole solid onto BRepClass3d.
+        if (st == G4StepSolid::FaceEntry::SurfType::Other) {
+            analyticInsideOK[si] = 0;  // unhandled surface → OCCT classifier for this solid
         }
     }
     // A solid with zero registered faces (degenerate) must not use analytic Inside.
@@ -1256,10 +1258,11 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
                                          std::vector<RayHit>& hits) const
 {
 
-    // Non-analytic surface type → caller must not be here (solid pre-screened).
-    if (fe.surfType != FaceEntry::SurfType::Plane &&
-        fe.surfType != FaceEntry::SurfType::Cylinder &&
-        fe.surfType != FaceEntry::SurfType::Sphere)
+    // Unhandled surface type (BSpline/Bezier/…) → caller must not be here (solid
+    // pre-screened via analyticInsideOK). Cone/Torus ARE handled: they are always
+    // analyticTrimSafe=false (Phase A) and fall to the trim-exact OCCT per-face
+    // intersector path below, so ray parity works for cone/torus solids.
+    if (fe.surfType == FaceEntry::SurfType::Other)
         return false;
 
     // Trim-exact path: any face whose UV bounding rectangle is NOT its exact trim

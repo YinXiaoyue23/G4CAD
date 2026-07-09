@@ -116,7 +116,7 @@ private:
 
         // Analytic geometry (Task 2/3): surface type + parameters extracted at construction.
         // Only the fields relevant to surfType are populated; others are default-initialised.
-        enum class SurfType : uint8_t { Other=0, Plane=1, Cylinder=2, Sphere=3 };
+        enum class SurfType : uint8_t { Other=0, Plane=1, Cylinder=2, Sphere=3, Cone=4, Torus=5 };
         SurfType surfType  = SurfType::Other;
 
         // Plane  (surfType==Plane): normal = pos.Direction(), U axis = pos.XDirection(),

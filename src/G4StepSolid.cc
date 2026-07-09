@@ -318,6 +318,20 @@ void G4StepSolid::BuildFaceWeights() {
                 }
                 break;
             }
+            case GeomAbs_Cone:
+                // Phase A (Cone/Torus): classify only; no analytic surface math yet.
+                // analyticTrimSafe=false routes the face through the trim-exact OCCT
+                // per-face IntCurvesFace_Intersector in the ray-parity path, so that
+                // cone/torus solids can use analytic-parity Inside() instead of the
+                // BRepClass3d_SolidClassifier pathology. Geometric params (half-angle,
+                // radii) are extracted later if Phase B/C adds analytic intersection.
+                fe.surfType         = FaceEntry::SurfType::Cone;
+                fe.analyticTrimSafe = false;
+                break;
+            case GeomAbs_Torus:
+                fe.surfType         = FaceEntry::SurfType::Torus;
+                fe.analyticTrimSafe = false;
+                break;
             default:
                 fe.surfType = FaceEntry::SurfType::Other;
                 break;
