@@ -1,4 +1,5 @@
 #include "G4StepSolid.hh"
+#include "G4StepConfig.hh"
 #include "G4SystemOfUnits.hh"
 #include "G4VoxelLimits.hh"
 #include "G4AffineTransform.hh"
@@ -85,16 +86,15 @@ namespace {
 }
 
 void G4StepSolid::InitRecorderOnce() {
-    const char* path = std::getenv("G4CAD_RECORD");
-    if (!path || !*path) { sRecordEnabled = false; return; }
+    const std::string& path = G4StepConfig::Get().recordPath;
+    if (path.empty()) { sRecordEnabled = false; return; }
     sRecordStream.open(path, std::ios::out | std::ios::trunc);
     if (!sRecordStream.is_open()) {
         G4cerr << "[G4StepSolid] G4CAD_RECORD set but cannot open " << path << G4endl;
         sRecordEnabled = false;
         return;
     }
-    const char* evEnv = std::getenv("G4CAD_RECORD_EVENT");
-    sRecordOnlyEvent = (evEnv && *evEnv) ? std::atoi(evEnv) : -1;
+    sRecordOnlyEvent = G4StepConfig::Get().recordEvent;
     sRecordStream << "seq,event,trackid,parentid,type,px,py,pz,vx,vy,vz,"
                   << "result,dist,inside_at_p,solid\n";
     sRecordEnabled = true;
@@ -150,15 +150,14 @@ G4StepSolid::G4StepSolid(const G4String& name, const TopoDS_Shape& stepShape,
     // Per-solid tolerances are computed lazily per thread in AlgoCache (keeps ABI stable).
     std::call_once(sRecordInitFlag, &G4StepSolid::InitRecorderOnce);
 
-    // CT-IN differential test gate (read once; cheap getenv per construction).
-    if (const char* fo = std::getenv("G4CAD_INSIDE_FORCE_OCCT"))
-        if (fo[0] == '1') sInsideForceOCCT = true;
+    // CT-IN differential test gate (centralised in G4StepConfig, read once).
+    if (G4StepConfig::Get().insideForceOCCT) sInsideForceOCCT = true;
 
     CalcBBox();
     BuildFaceWeights();
 
     // Enable per-call timing when G4CAD_TIMER is set; zero overhead otherwise.
-    if (std::getenv("G4CAD_TIMER")) SetTimingEnabled(true);
+    if (G4StepConfig::Get().timing) SetTimingEnabled(true);
 }
 
 G4StepSolid::~G4StepSolid() {
@@ -393,7 +392,7 @@ EInside G4StepSolid::Inside(const G4ThreeVector& p) const {
             EInside ai = InsideSolidAnalytic((int)i, p, algo, ok);
             if (ok) {
                 // CT-IN debug self-check: compare analytic vs OCCT per solid.
-                static bool selfcheck = std::getenv("G4CAD_INSIDE_SELFCHECK") != nullptr;
+                static bool selfcheck = G4StepConfig::Get().insideSelfcheck;
                 if (selfcheck) {
                     algo->solidClassifiers[i]->Perform(pt, algo->SolidBand((int)i));
                     auto st = algo->solidClassifiers[i]->State();

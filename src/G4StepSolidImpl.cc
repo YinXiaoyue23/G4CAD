@@ -1,4 +1,5 @@
 #include "G4StepSolid.hh"
+#include "G4StepConfig.hh"
 
 // OCCT
 #include <BRep_Tool.hxx>
@@ -317,8 +318,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
 {
     requestedTol = (tolerance > 0.0) ? tolerance : 1e-7;
 
-    const char* psEnv = std::getenv("G4CAD_PERSOLID_TOL");
-    perSolidTol = (psEnv && psEnv[0] == '1');
+    perSolidTol = G4StepConfig::Get().perSolidTol;
 
     G4double globalMax = requestedTol;
     int si = 0;
@@ -390,7 +390,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
         const int nF = (int)ownerSolid->fFaces.size();
         faceUVTrim.resize(nF);
         int nValid = 0, nBand = 0, nPoly = 0;
-        const bool uvOff = (std::getenv("G4CAD_UVTRIM_OFF") != nullptr);  // A/B vs CT1
+        const bool uvOff = G4StepConfig::Get().uvTrimOff;  // A/B vs CT1
         for (int fi = 0; !uvOff && fi < nF; ++fi) {
             faceUVTrim[fi] = ownerSolid->BuildUVTrim(ownerSolid->fFaces[fi], occtTol);
             if (faceUVTrim[fi].valid) {
@@ -398,7 +398,7 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                 if (faceUVTrim[fi].mode == UVTrim::Mode::Poly) ++nPoly; else ++nBand;
             }
         }
-        if (std::getenv("G4CAD_UVTRIM_VERBOSE"))
+        if (G4StepConfig::Get().uvTrimVerbose)
             G4cout << "[CT-TRIM] " << ownerSolid->GetName() << ": "
                    << nValid << "/" << nF << " faces use UV trim ("
                    << nBand << " band, " << nPoly << " polygon)" << G4endl;
@@ -456,14 +456,14 @@ G4StepSolid::AlgoCache::AlgoCache(const TopoDS_Shape& shape, G4double tolerance,
                 double L = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
                 solidParityDirs[i].emplace_back(d[0]/L, d[1]/L, d[2]/L);
             }
-            if (std::getenv("G4CAD_PARITY_DIRSEL"))
+            if (G4StepConfig::Get().parityDirSel)
                 G4cout << "[DIRSEL] solid#" << i << " best cand=" << cost[0].second
                        << " t=" << cost[0].first << "ns  worst t=" << cost.back().first << "ns" << G4endl;
         }
     }
 
     static std::once_flag tolPrintFlag;
-    if (std::getenv("G4CAD_TOL_VERBOSE"))
+    if (G4StepConfig::Get().tolVerbose)
         std::call_once(tolPrintFlag, [&]{
             G4cout << "[G4StepSolid] per-solid tolerance "
                    << (perSolidTol ? "ON" : "OFF(global)")
@@ -1016,12 +1016,11 @@ G4StepSolid::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
     if (v1 <= v0 || u1 <= u0) return t;
     const double uspan = u1 - u0;
     const TopoDS_Face& face = fe.face;
-    const bool dbg = (std::getenv("G4CAD_UVTRIM_DEBUG") != nullptr);
+    const bool dbg = G4StepConfig::Get().uvTrimDebug;
 
     // Runtime boundary band (UV units). v maps 1:1 to mm (axial). Any hit within this of
     // an envelope / polygon / hole edge is deferred to the exact OCCT intersector.
-    double band = 0.02;
-    if (const char* be = std::getenv("G4CAD_UVTRIM_BAND")) band = std::atof(be);
+    double band = G4StepConfig::Get().uvTrimBand;
     t.band = band;
     t.u0 = u0; t.u1 = u1; t.v0 = v0; t.v1 = v1;
     t.periodic = fullU;
@@ -1145,7 +1144,7 @@ G4StepSolid::BuildUVTrim(const FaceEntry& fe, G4double octTol) const {
     // ring (hole). The seam is handled because the rings carry the vertical seam
     // segments at u0/u1 explicitly — no unwrapping, no ±2π query shifting needed.
     // ============================================================================
-    if (std::getenv("G4CAD_UVTRIM_NOPOLY") == nullptr) {
+    if (!G4StepConfig::Get().uvTrimNoPoly) {
         // Per-wire: build closed UV rings by chaining oriented edge polylines.
         std::vector<std::vector<double>> outU, outV, holeU, holeV;
         const double chainTol = 1e-4;              // endpoint match tolerance in UV
