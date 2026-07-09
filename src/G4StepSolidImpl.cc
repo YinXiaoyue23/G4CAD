@@ -136,6 +136,69 @@ namespace {
         out[0] = { t, trans, uf, vf };
         return 1;
     }
+
+    // Ray vs cylinder. Returns 0..2 candidates in root order (near root first).
+    // Applies only the UNIVERSAL checks (t>=-tol, axial-v range, r>0) and the uf
+    // normalization (needs u0). It deliberately does NOT apply the angular u-range
+    // reject nor the CT-TRIM band — those differ per caller (rect-UV vs
+    // ClassifyUVTrim) and stay in the caller. trans is computed for every returned
+    // candidate; callers discard off-trim ones (a discarded candidate's trans is
+    // never used, so result is identical to the old compute-after-reject order).
+    inline int RayIntersectCylinder(const gp_Ax3& ax, G4double R,
+                                    G4double u0, G4double v0, G4double v1,
+                                    bool fwd,
+                                    G4double ox, G4double oy, G4double oz,
+                                    G4double dx, G4double dy, G4double dz,
+                                    G4double tol, RaySurfCand out[2])
+    {
+        const gp_Dir& axDir = ax.Direction();
+        const gp_Pnt& axLoc = ax.Location();
+        G4double dpx = ox-axLoc.X(), dpy = oy-axLoc.Y(), dpz = oz-axLoc.Z();
+        G4double da  = axDir.X()*dpx + axDir.Y()*dpy + axDir.Z()*dpz;
+        G4double va_ = axDir.X()*dx  + axDir.Y()*dy  + axDir.Z()*dz;
+        G4double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
+        G4double vpx = dx-va_*axDir.X(),   vpy = dy-va_*axDir.Y(),   vpz = dz-va_*axDir.Z();
+        G4double A = vpx*vpx + vpy*vpy + vpz*vpz;
+        if (A < 1e-30) return 0;
+        G4double B    = ppx*vpx + ppy*vpy + ppz*vpz;
+        G4double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
+        G4double disc = B*B - A*C;
+        if (disc < 0) return 0;
+        G4double sqrtD = std::sqrt(std::max(disc, 0.0));
+        bool     tang  = (sqrtD < tol * std::sqrt(A));
+        const gp_Dir& xu_c = ax.XDirection();
+        const gp_Dir& yv_c = ax.YDirection();
+        int n = 0;
+        auto tryRoot = [&](G4double t) {
+            if (t < -tol) return;
+            G4double v_ax = da + t * va_;
+            if (v_ax < v0 - tol || v_ax > v1 + tol) return;
+            G4double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
+            G4double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+            if (r < 1e-15) return;
+            G4double uf = std::atan2(yv_c.X()*qx + yv_c.Y()*qy + yv_c.Z()*qz,
+                                     xu_c.X()*qx + xu_c.Y()*qy + xu_c.Z()*qz);
+            if (uf < u0 - M_PI) uf += 2.0*M_PI;
+            IntCurveSurface_TransitionOnCurve trans;
+            if (tang) {
+                trans = IntCurveSurface_Tangent;
+            } else {
+                G4double n_dot_v = (qx*dx + qy*dy + qz*dz) / r;
+                G4double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                if      (n_out_v < -tol) trans = IntCurveSurface_In;
+                else if (n_out_v >  tol) trans = IntCurveSurface_Out;
+                else                     trans = IntCurveSurface_Tangent;
+            }
+            out[n++] = { t, trans, uf, v_ax };
+        };
+        if (tang) {
+            tryRoot(-B / A);
+        } else {
+            tryRoot((-B - sqrtD) / A);
+            tryRoot((-B + sqrtD) / A);
+        }
+        return n;
+    }
 } // namespace
 
 // ====================================================================
@@ -566,65 +629,15 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 
         // ─── Cylinder ────────────────────────────────────────────────────
         } else if (fe.surfType == FaceEntry::SurfType::Cylinder) {
-            const gp_Ax3& ax    = fe.pos;
-            const gp_Dir& axDir = ax.Direction();
-            const gp_Pnt& axLoc = ax.Location();
-            const double   R    = fe.cylR;
-
-            double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
-            double da = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
-            double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), v.x(),v.y(),v.z());
-            double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
-            double vpx = v.x()-va_*axDir.X(), vpy = v.y()-va_*axDir.Y(), vpz = v.z()-va_*axDir.Z();
-
-            double A = vpx*vpx + vpy*vpy + vpz*vpz;
-            if (A >= 1e-30) {
-                double B    = ppx*vpx + ppy*vpy + ppz*vpz;
-                double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
-                double disc = B*B - A*C;
-
-                if (disc >= 0) {
-                    double sqrtD  = std::sqrt(std::max(disc, 0.0));
-                    bool   tang   = (sqrtD < octTol * std::sqrt(A));
-                    bool   fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
-                    bool   fwd    = (fe.face.Orientation() != TopAbs_REVERSED);
-
-                    auto tryRoot = [&](double t) {
-                        if (t < -octTol) return;
-                        double v_ax = da + t * va_;
-                        if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
-                        double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
-                        double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
-                        if (r < 1e-15) return;
-                        // Always compute uf (needed for correct normal in calcNorm path)
-                        const gp_Dir& xu_c = ax.XDirection();
-                        const gp_Dir& yv_c = ax.YDirection();
-                        double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
-                                               dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
-                        // Normalize to [u0, u0+2π]
-                        if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
-                        if (!fullAng && (uf < fe.u0 - octTol || uf > fe.u1 + octTol)) return;
-                        IntCurveSurface_TransitionOnCurve trans;
-                        if (tang) {
-                            trans = IntCurveSurface_Tangent;
-                        } else {
-                            double n_dot_v = dot3(qx,qy,qz, v.x(),v.y(),v.z()) / r;
-                            double n_out_v = fwd ? n_dot_v : -n_dot_v;
-                            if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                            else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                            else                        trans = IntCurveSurface_Tangent;
-                        }
-                        rawHits.emplace_back(t, trans, fe.face, uf, v_ax);
-                        if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
-                    };
-
-                    if (tang) {
-                        tryRoot(-B / A);
-                    } else {
-                        tryRoot((-B - sqrtD) / A);
-                        tryRoot((-B + sqrtD) / A);
-                    }
-                }
+            bool fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+            bool fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
+            RaySurfCand cand[2];
+            int nc = RayIntersectCylinder(fe.pos, fe.cylR, fe.u0, fe.v0, fe.v1, fwd,
+                                          p.x(),p.y(),p.z(), v.x(),v.y(),v.z(), octTol, cand);
+            for (int c = 0; c < nc; ++c) {
+                if (!fullAng && (cand[c].u < fe.u0 - octTol || cand[c].u > fe.u1 + octTol)) continue;
+                rawHits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
+                if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
             }
             analytic = true;
             if (fTimingEnabled) ++algo->timing.rayAnalyticCount;
@@ -1241,70 +1254,26 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
             (fi < (int)algo->faceUVTrim.size()) ? algo->faceUVTrim[fi]
                                                 : AlgoCache::UVTrim{};
         if (tm.valid && fe.surfType == FaceEntry::SurfType::Cylinder) {
-            const gp_Ax3& ax    = fe.pos;
-            const gp_Dir& axDir = ax.Direction();
-            const gp_Pnt& axLoc = ax.Location();
-            const double   R    = fe.cylR;
-            double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
-            double da  = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
-            double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), dir.x(),dir.y(),dir.z());
-            double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
-            double vpx = dir.x()-va_*axDir.X(), vpy = dir.y()-va_*axDir.Y(), vpz = dir.z()-va_*axDir.Z();
-            double A = vpx*vpx + vpy*vpy + vpz*vpz;
-            bool   deferOCCT = false;
-            // Stage roots into a scratch list; commit only if no ambiguity.
-            struct Cand { double t; IntCurveSurface_TransitionOnCurve tr; double u, v; };
-            Cand staged[2];
+            bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+            RaySurfCand cand[2];
+            int nc = RayIntersectCylinder(fe.pos, fe.cylR, fe.u0, fe.v0, fe.v1, fwd,
+                                          p.x(),p.y(),p.z(), dir.x(),dir.y(),dir.z(), octTol, cand);
+            // Classify each candidate (in root order) against the validated v-band
+            // trim; commit only if none is ambiguous. Stop at the first band hit
+            // (mirrors the old deferOCCT short-circuit). A/disc failure → nc==0 →
+            // empty accept (uvTrimAccept++), matching the old behaviour.
+            bool deferOCCT = false;
+            RaySurfCand staged[2];
             int  nStaged = 0;
-            if (A >= 1e-30) {
-                double B    = ppx*vpx + ppy*vpy + ppz*vpz;
-                double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
-                double disc = B*B - A*C;
-                if (disc >= 0) {
-                    double sqrtD = std::sqrt(std::max(disc, 0.0));
-                    bool   tang  = (sqrtD < octTol * std::sqrt(A));
-                    bool   fwd   = (fe.face.Orientation() != TopAbs_REVERSED);
-                    auto tryRoot = [&](double t) {
-                        if (deferOCCT) return;
-                        if (t < -octTol) return;
-                        double v_ax = da + t * va_;
-                        // outside axial domain (with margin) → definitely off the face
-                        if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
-                        double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
-                        double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
-                        if (r < 1e-15) return;
-                        const gp_Dir& xu_c = ax.XDirection();
-                        const gp_Dir& yv_c = ax.YDirection();
-                        double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
-                                               dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
-                        if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
-                        // Classify (uf, v_ax) against the validated v-band trim.
-                        int cls = ClassifyUVTrim(tm, uf, v_ax);
-                        if (cls < 0) { deferOCCT = true; return; }  // boundary band → OCCT
-                        if (cls == 0) return;                        // off the real face
-                        IntCurveSurface_TransitionOnCurve trans;
-                        if (tang) {
-                            trans = IntCurveSurface_Tangent;
-                        } else {
-                            double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
-                            double n_out_v = fwd ? n_dot_v : -n_dot_v;
-                            if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                            else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                            else                        trans = IntCurveSurface_Tangent;
-                        }
-                        staged[nStaged++] = { t, trans, uf, v_ax };
-                    };
-                    if (tang) {
-                        tryRoot(-B / A);
-                    } else {
-                        tryRoot((-B - sqrtD) / A);
-                        tryRoot((-B + sqrtD) / A);
-                    }
-                }
+            for (int c = 0; c < nc; ++c) {
+                int cls = ClassifyUVTrim(tm, cand[c].u, cand[c].v);
+                if (cls < 0) { deferOCCT = true; break; }  // boundary band → OCCT
+                if (cls == 0) continue;                     // off the real face
+                staged[nStaged++] = cand[c];
             }
             if (!deferOCCT) {
                 for (int s = 0; s < nStaged; ++s)
-                    hits.emplace_back(staged[s].t, staged[s].tr, fe.face,
+                    hits.emplace_back(staged[s].t, staged[s].trans, fe.face,
                                       staged[s].u, staged[s].v);
                 if (fTimingEnabled) ++algo->uvTrimAccept;
                 return true;
@@ -1340,60 +1309,14 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
 
     // ─── Cylinder (full periodic, rectangular v-trim → UV box exact) ───────
     if (fe.surfType == FaceEntry::SurfType::Cylinder) {
-        const gp_Ax3& ax    = fe.pos;
-        const gp_Dir& axDir = ax.Direction();
-        const gp_Pnt& axLoc = ax.Location();
-        const double   R    = fe.cylR;
-
-        double dpx = p.x()-axLoc.X(), dpy = p.y()-axLoc.Y(), dpz = p.z()-axLoc.Z();
-        double da  = dot3(axDir.X(),axDir.Y(),axDir.Z(), dpx,dpy,dpz);
-        double va_ = dot3(axDir.X(),axDir.Y(),axDir.Z(), dir.x(),dir.y(),dir.z());
-        double ppx = dpx - da*axDir.X(), ppy = dpy - da*axDir.Y(), ppz = dpz - da*axDir.Z();
-        double vpx = dir.x()-va_*axDir.X(), vpy = dir.y()-va_*axDir.Y(), vpz = dir.z()-va_*axDir.Z();
-
-        double A = vpx*vpx + vpy*vpy + vpz*vpz;
-        if (A >= 1e-30) {
-            double B    = ppx*vpx + ppy*vpy + ppz*vpz;
-            double C    = ppx*ppx + ppy*ppy + ppz*ppz - R*R;
-            double disc = B*B - A*C;
-            if (disc >= 0) {
-                double sqrtD   = std::sqrt(std::max(disc, 0.0));
-                bool   tang    = (sqrtD < octTol * std::sqrt(A));
-                bool   fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
-                bool   fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
-
-                auto tryRoot = [&](double t) {
-                    if (t < -octTol) return;
-                    double v_ax = da + t * va_;
-                    if (v_ax < fe.v0 - octTol || v_ax > fe.v1 + octTol) return;
-                    double qx = ppx+t*vpx, qy = ppy+t*vpy, qz = ppz+t*vpz;
-                    double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
-                    if (r < 1e-15) return;
-                    const gp_Dir& xu_c = ax.XDirection();
-                    const gp_Dir& yv_c = ax.YDirection();
-                    double uf = std::atan2(dot3(yv_c.X(),yv_c.Y(),yv_c.Z(), qx,qy,qz),
-                                           dot3(xu_c.X(),xu_c.Y(),xu_c.Z(), qx,qy,qz));
-                    if (uf < fe.u0 - M_PI) uf += 2.0*M_PI;
-                    if (!fullAng && (uf < fe.u0 - octTol || uf > fe.u1 + octTol)) return;
-                    IntCurveSurface_TransitionOnCurve trans;
-                    if (tang) {
-                        trans = IntCurveSurface_Tangent;
-                    } else {
-                        double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
-                        double n_out_v = fwd ? n_dot_v : -n_dot_v;
-                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                        else                        trans = IntCurveSurface_Tangent;
-                    }
-                    hits.emplace_back(t, trans, fe.face, uf, v_ax);
-                };
-                if (tang) {
-                    tryRoot(-B / A);
-                } else {
-                    tryRoot((-B - sqrtD) / A);
-                    tryRoot((-B + sqrtD) / A);
-                }
-            }
+        bool fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+        bool fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
+        RaySurfCand cand[2];
+        int nc = RayIntersectCylinder(fe.pos, fe.cylR, fe.u0, fe.v0, fe.v1, fwd,
+                                      p.x(),p.y(),p.z(), dir.x(),dir.y(),dir.z(), octTol, cand);
+        for (int c = 0; c < nc; ++c) {
+            if (!fullAng && (cand[c].u < fe.u0 - octTol || cand[c].u > fe.u1 + octTol)) continue;
+            hits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
         }
         return true;
     }
