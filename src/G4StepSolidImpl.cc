@@ -199,6 +199,68 @@ namespace {
         }
         return n;
     }
+
+    // Ray vs sphere. Returns 0..2 candidates in root order. There is no CT-TRIM
+    // sphere variant and the !fullSph UV-rectangle reject is identical at both
+    // sphere sites, so it is folded in here. fullSph is derived from the UV span
+    // exactly as before.
+    inline int RayIntersectSphere(const gp_Ax3& pos, G4double R,
+                                  G4double u0, G4double u1, G4double v0, G4double v1,
+                                  bool fwd,
+                                  G4double ox, G4double oy, G4double oz,
+                                  G4double dx, G4double dy, G4double dz,
+                                  G4double tol, RaySurfCand out[2])
+    {
+        const gp_Pnt& cen = pos.Location();
+        G4double dpx = ox-cen.X(), dpy = oy-cen.Y(), dpz = oz-cen.Z();
+        G4double A    = dx*dx + dy*dy + dz*dz;
+        G4double B    = dpx*dx + dpy*dy + dpz*dz;
+        G4double C    = dpx*dpx + dpy*dpy + dpz*dpz - R*R;
+        G4double disc = B*B - A*C;
+        if (disc < 0) return 0;
+        G4double sqrtD   = std::sqrt(std::max(disc, 0.0));
+        bool     tang    = (sqrtD < tol * std::sqrt(A));
+        bool     fullSph = (u1-u0 >= 2.0*M_PI-tol && v1-v0 >= M_PI-tol);
+        int n = 0;
+        auto tryRoot = [&](G4double t) {
+            if (t < -tol) return;
+            G4double qx = dpx+t*dx, qy = dpy+t*dy, qz = dpz+t*dz;
+            G4double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
+            if (r < 1e-15) return;
+            G4double uf = 0.0, vf = 0.0;
+            if (!fullSph) {
+                const gp_Dir& xu  = pos.XDirection();
+                const gp_Dir& yv_ = pos.YDirection();
+                const gp_Dir& zv_ = pos.Direction();
+                G4double xl = xu.X()*qx + xu.Y()*qy + xu.Z()*qz;
+                G4double yl = yv_.X()*qx + yv_.Y()*qy + yv_.Z()*qz;
+                G4double zl = zv_.X()*qx + zv_.Y()*qy + zv_.Z()*qz;
+                uf = std::atan2(yl, xl);
+                vf = std::asin(std::max(-1.0, std::min(1.0, zl/r)));
+                if (uf < u0 - tol) uf += 2.0*M_PI;
+                if (uf < u0 - tol || uf > u1 + tol) return;
+                if (vf < v0 - tol || vf > v1 + tol) return;
+            }
+            IntCurveSurface_TransitionOnCurve trans;
+            if (tang) {
+                trans = IntCurveSurface_Tangent;
+            } else {
+                G4double n_dot_v = (qx*dx + qy*dy + qz*dz) / r;
+                G4double n_out_v = fwd ? n_dot_v : -n_dot_v;
+                if      (n_out_v < -tol) trans = IntCurveSurface_In;
+                else if (n_out_v >  tol) trans = IntCurveSurface_Out;
+                else                     trans = IntCurveSurface_Tangent;
+            }
+            out[n++] = { t, trans, uf, vf };
+        };
+        if (tang) {
+            tryRoot(-B / A);
+        } else {
+            tryRoot((-B - sqrtD) / A);
+            tryRoot((-B + sqrtD) / A);
+        }
+        return n;
+    }
 } // namespace
 
 // ====================================================================
@@ -601,12 +663,6 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
     std::vector<RayHit>& rawHits = algo->scratchHits;
     rawHits.clear();
 
-    // Inline dot helper
-    auto dot3 = [](double ax_, double ay_, double az_,
-                   double bx_, double by_, double bz_) {
-        return ax_*bx_ + ay_*by_ + az_*bz_;
-    };
-
     for (int fi = 0; fi < (int)fFaces.size(); ++fi) {
         const FaceEntry& fe = fFaces[fi];
         if (!rayHitsBox(ray.Location(), invDir, fe.bbox, octTol)) continue;
@@ -644,61 +700,13 @@ G4double G4StepSolid::RayCastToBoundary(const G4ThreeVector& p, const G4ThreeVec
 
         // ─── Sphere ──────────────────────────────────────────────────────
         } else if (fe.surfType == FaceEntry::SurfType::Sphere) {
-            const gp_Pnt& cen = fe.pos.Location();
-            const double   R  = fe.sphR;
-
-            double dpx = p.x()-cen.X(), dpy = p.y()-cen.Y(), dpz = p.z()-cen.Z();
-            double A    = v.x()*v.x() + v.y()*v.y() + v.z()*v.z();  // ≈ 1 for unit v
-            double B    = dpx*v.x() + dpy*v.y() + dpz*v.z();
-            double C    = dpx*dpx + dpy*dpy + dpz*dpz - R*R;
-            double disc = B*B - A*C;
-
-            if (disc >= 0) {
-                double sqrtD     = std::sqrt(std::max(disc, 0.0));
-                bool   tang      = (sqrtD < octTol * std::sqrt(A));
-                bool   fullSph   = (fe.u1-fe.u0 >= 2.0*M_PI-octTol &&
-                                    fe.v1-fe.v0 >= M_PI-octTol);
-                bool   fwd       = (fe.face.Orientation() != TopAbs_REVERSED);
-
-                auto tryRoot = [&](double t) {
-                    if (t < -octTol) return;
-                    double qx = dpx+t*v.x(), qy = dpy+t*v.y(), qz = dpz+t*v.z();
-                    double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
-                    if (r < 1e-15) return;
-                    double uf = 0.0, vf = 0.0;
-                    if (!fullSph) {
-                        const gp_Dir& xu   = fe.pos.XDirection();
-                        const gp_Dir& yv_  = fe.pos.YDirection();
-                        const gp_Dir& zv_  = fe.pos.Direction();
-                        double xl = dot3(xu.X(),xu.Y(),xu.Z(), qx,qy,qz);
-                        double yl = dot3(yv_.X(),yv_.Y(),yv_.Z(), qx,qy,qz);
-                        double zl = dot3(zv_.X(),zv_.Y(),zv_.Z(), qx,qy,qz);
-                        uf = std::atan2(yl, xl);
-                        vf = std::asin(std::max(-1.0, std::min(1.0, zl/r)));
-                        if (uf < fe.u0 - octTol) uf += 2.0*M_PI;
-                        if (uf < fe.u0 - octTol || uf > fe.u1 + octTol) return;
-                        if (vf < fe.v0 - octTol || vf > fe.v1 + octTol) return;
-                    }
-                    IntCurveSurface_TransitionOnCurve trans;
-                    if (tang) {
-                        trans = IntCurveSurface_Tangent;
-                    } else {
-                        double n_dot_v = dot3(qx,qy,qz, v.x(),v.y(),v.z()) / r;
-                        double n_out_v = fwd ? n_dot_v : -n_dot_v;
-                        if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                        else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                        else                        trans = IntCurveSurface_Tangent;
-                    }
-                    rawHits.emplace_back(t, trans, fe.face, uf, vf);
-                    if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
-                };
-
-                if (tang) {
-                    tryRoot(-B / A);
-                } else {
-                    tryRoot((-B - sqrtD) / A);
-                    tryRoot((-B + sqrtD) / A);
-                }
+            bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+            RaySurfCand cand[2];
+            int nc = RayIntersectSphere(fe.pos, fe.sphR, fe.u0, fe.u1, fe.v0, fe.v1, fwd,
+                                        p.x(),p.y(),p.z(), v.x(),v.y(),v.z(), octTol, cand);
+            for (int c = 0; c < nc; ++c) {
+                rawHits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
+                if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
             }
             analytic = true;
             if (fTimingEnabled) ++algo->timing.rayAnalyticCount;
@@ -1225,10 +1233,6 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
                                          const G4ThreeVector& dir, G4double octTol,
                                          std::vector<RayHit>& hits) const
 {
-    auto dot3 = [](double ax_, double ay_, double az_,
-                   double bx_, double by_, double bz_) {
-        return ax_*bx_ + ay_*by_ + az_*bz_;
-    };
 
     // Non-analytic surface type → caller must not be here (solid pre-screened).
     if (fe.surfType != FaceEntry::SurfType::Plane &&
@@ -1323,59 +1327,12 @@ bool G4StepSolid::IntersectFaceForParity(const FaceEntry& fe, const G4ThreeVecto
 
     // ─── Sphere ───────────────────────────────────────────────────────────
     if (fe.surfType == FaceEntry::SurfType::Sphere) {
-        const gp_Pnt& cen = fe.pos.Location();
-        const double   R  = fe.sphR;
-
-        double dpx = p.x()-cen.X(), dpy = p.y()-cen.Y(), dpz = p.z()-cen.Z();
-        double A    = dir.x()*dir.x() + dir.y()*dir.y() + dir.z()*dir.z();  // ≈ 1 (unit dir)
-        double B    = dpx*dir.x() + dpy*dir.y() + dpz*dir.z();
-        double C    = dpx*dpx + dpy*dpy + dpz*dpz - R*R;
-        double disc = B*B - A*C;
-        if (disc >= 0) {
-            double sqrtD   = std::sqrt(std::max(disc, 0.0));
-            bool   tang    = (sqrtD < octTol * std::sqrt(A));
-            bool   fullSph = (fe.u1-fe.u0 >= 2.0*M_PI-octTol &&
-                              fe.v1-fe.v0 >= M_PI-octTol);
-            bool   fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
-
-            auto tryRoot = [&](double t) {
-                if (t < -octTol) return;
-                double qx = dpx+t*dir.x(), qy = dpy+t*dir.y(), qz = dpz+t*dir.z();
-                double r  = std::sqrt(qx*qx + qy*qy + qz*qz);
-                if (r < 1e-15) return;
-                double uf = 0.0, vf = 0.0;
-                if (!fullSph) {
-                    const gp_Dir& xu   = fe.pos.XDirection();
-                    const gp_Dir& yv_  = fe.pos.YDirection();
-                    const gp_Dir& zv_  = fe.pos.Direction();
-                    double xl = dot3(xu.X(),xu.Y(),xu.Z(), qx,qy,qz);
-                    double yl = dot3(yv_.X(),yv_.Y(),yv_.Z(), qx,qy,qz);
-                    double zl = dot3(zv_.X(),zv_.Y(),zv_.Z(), qx,qy,qz);
-                    uf = std::atan2(yl, xl);
-                    vf = std::asin(std::max(-1.0, std::min(1.0, zl/r)));
-                    if (uf < fe.u0 - octTol) uf += 2.0*M_PI;
-                    if (uf < fe.u0 - octTol || uf > fe.u1 + octTol) return;
-                    if (vf < fe.v0 - octTol || vf > fe.v1 + octTol) return;
-                }
-                IntCurveSurface_TransitionOnCurve trans;
-                if (tang) {
-                    trans = IntCurveSurface_Tangent;
-                } else {
-                    double n_dot_v = dot3(qx,qy,qz, dir.x(),dir.y(),dir.z()) / r;
-                    double n_out_v = fwd ? n_dot_v : -n_dot_v;
-                    if      (n_out_v < -octTol) trans = IntCurveSurface_In;
-                    else if (n_out_v >  octTol) trans = IntCurveSurface_Out;
-                    else                        trans = IntCurveSurface_Tangent;
-                }
-                hits.emplace_back(t, trans, fe.face, uf, vf);
-            };
-            if (tang) {
-                tryRoot(-B / A);
-            } else {
-                tryRoot((-B - sqrtD) / A);
-                tryRoot((-B + sqrtD) / A);
-            }
-        }
+        bool fwd = (fe.face.Orientation() != TopAbs_REVERSED);
+        RaySurfCand cand[2];
+        int nc = RayIntersectSphere(fe.pos, fe.sphR, fe.u0, fe.u1, fe.v0, fe.v1, fwd,
+                                    p.x(),p.y(),p.z(), dir.x(),dir.y(),dir.z(), octTol, cand);
+        for (int c = 0; c < nc; ++c)
+            hits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
         return true;
     }
 
