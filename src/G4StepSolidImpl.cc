@@ -687,18 +687,31 @@ G4double G4StepSolidImpl::RayCastToBoundary(const G4ThreeVector& p, const G4Thre
 
         // ─── Cylinder ────────────────────────────────────────────────────
         } else if (fe.surfType == FaceEntry::SurfType::Cylinder) {
-            bool fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
-            bool fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
-            RaySurfCand cand[2];
-            int nc = RayIntersectCylinder(fe.pos, fe.cylR, fe.u0, fe.v0, fe.v1, fwd,
-                                          p.x(),p.y(),p.z(), v.x(),v.y(),v.z(), octTol, cand);
-            for (int c = 0; c < nc; ++c) {
-                if (!fullAng && (cand[c].u < fe.u0 - octTol || cand[c].u > fe.u1 + octTol)) continue;
-                rawHits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
-                if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
+            if (fe.analyticTrimSafe) {
+                // Trim-safe: UV rectangle == exact trim (full-360, 4 clean edges).
+                // Fast analytic rectangle clip (cylinder.step, box_hole hole, RP solid_6).
+                bool fwd     = (fe.face.Orientation() != TopAbs_REVERSED);
+                bool fullAng = (fe.u1 - fe.u0 >= 2.0*M_PI - octTol);
+                RaySurfCand cand[2];
+                int nc = RayIntersectCylinder(fe.pos, fe.cylR, fe.u0, fe.v0, fe.v1, fwd,
+                                              p.x(),p.y(),p.z(), v.x(),v.y(),v.z(), octTol, cand);
+                for (int c = 0; c < nc; ++c) {
+                    if (!fullAng && (cand[c].u < fe.u0 - octTol || cand[c].u > fe.u1 + octTol)) continue;
+                    rawHits.emplace_back(cand[c].t, cand[c].trans, fe.face, cand[c].u, cand[c].v);
+                    if (fTimingEnabled) algo->timing.rayHitsTotal += 1;
+                }
+                if (fTimingEnabled) ++algo->timing.rayAnalyticCount;
+            } else {
+                // Non-trim-safe cylinder (partial-angle / curved-edge / cutout): the UV
+                // rectangle OVER-COVERS the true trim, so a plain rectangle clip yields
+                // false-positive hits (RP solid_0/1 phantom entry → edep over-estimate,
+                // and DistanceToIn contradicting Inside()). Delegate to the SAME
+                // trim-aware per-face intersection Inside() uses (CT-TRIM band → analytic
+                // ClassifyUVTrim, else the trim-exact OCCT per-face intersector), so
+                // DistanceToIn/Out agree with Inside(). Banded faces stay analytic.
+                IntersectFaceForParity(fe, p, v, octTol, rawHits);
             }
             analytic = true;
-            if (fTimingEnabled) ++algo->timing.rayAnalyticCount;
 
         // ─── Sphere ──────────────────────────────────────────────────────
         } else if (fe.surfType == FaceEntry::SurfType::Sphere) {
@@ -882,14 +895,21 @@ G4double G4StepSolidImpl::RayCastToBoundary(const G4ThreeVector& p, const G4Thre
         //     boundary (e.g. traversing a concave hole), the particle ends up deep inside
         //     the solid but is still tracked in World. All forward hits are Exit transitions
         //     (particle heading outward through the solid). Inside(p) confirms mis-tracking.
-        // Cases (a)/(b): smallest group dist < octTol*1e4 ≈ 1 µm.
-        // Case (c): Inside(p) != kOutside.
-        if (!algo->scratchGroups.empty()) {
-            const G4double dMin = algo->scratchGroups.front().dist;
-            if (dMin >= 0.0 && dMin < octTol * 1e4)
-                return kCarTolerance;
-        }
-        if (Inside(p) != kOutside)
+        // Cases (a)/(b)/(c) all share one physical invariant: the particle is
+        // genuinely INSIDE the solid (mis-located in World). At r=R+δ the overshoot
+        // δ (10–500 nm) exceeds the surface band, so Inside(p) classifies kInside.
+        // Only that case warrants the kCarTolerance correcting micro-step.
+        //
+        // A particle merely ON the surface and LEAVING (Inside(p)==kSurface) is the
+        // convex-exit case — e.g. a track exiting a sphere/cone/torus face axially.
+        // The only forward hit is the current exit face at t≈0 (net-Exit); there is
+        // no genuine forward re-entry, so the contract answer is kInfinity. Returning
+        // kCarTolerance here made the navigator re-enter the just-exited solid at a
+        // ~1e-9 distance, producing an unbounded 1e-9(in)/0(out) stuck oscillation
+        // (sphere geantino: 144 steps and 53k zero-length steps vs native/G4OCCT 3).
+        // The old dMin<1µm and Inside!=kOutside fallbacks were direction-blind and
+        // fired on this convex-exit t≈0 hit; gate strictly on kInside instead.
+        if (Inside(p) == kInside)
             return kCarTolerance;
         if (fVerboseLevel >= 2)
             G4cout << "[G4StepSolidImpl::" << GetName() << "::DistanceToIn][local]"
